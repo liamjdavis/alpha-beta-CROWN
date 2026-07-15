@@ -168,6 +168,40 @@ class BICCOS:
                     # The cuts will be stored in self.tmp_cuts
                     self.constraint_strengthening(d, net, ret, v_idx, heuristic)
 
+                    # ---------------- phase probing start ----------------
+                    # Vivify freshly inferred blocking clauses with the
+                    # phase-implication graph collected by phase probing
+                    # (see phase_probing.vivify_biccos_cuts for the
+                    # soundness argument). Literal indices must agree with
+                    # the arelu_decision convention (index into net.relus),
+                    # so we verify that self.key_mapping is aligned with the
+                    # relu ordering before applying anything.
+                    pp_impl = getattr(net, 'phase_probing_implications_int', None)
+                    pp_forced = getattr(net, 'phase_probing_forced_int', None)
+                    if (pp_impl or pp_forced) and \
+                            arguments.Config['solver']['phase_probing']['vivify_biccos']:
+                        relus = net.net.relus
+                        aligned = all(
+                            self.key_mapping.get(r.inputs[0].name) == i
+                            for i, r in enumerate(relus))
+                        if aligned:
+                            from phase_probing import vivify_biccos_cuts
+                            n_lit, n_cut = vivify_biccos_cuts(
+                                self.tmp_cuts, pp_impl or {}, pp_forced or {})
+                            self.pp_vivified_literals = getattr(
+                                self, 'pp_vivified_literals', 0) + n_lit
+                            self.pp_vivified_cuts = getattr(
+                                self, 'pp_vivified_cuts', 0) + n_cut
+                            print(f'Phase probing vivification: removed '
+                                  f'{n_lit} literals from {n_cut} BICCOS '
+                                  f'cuts (cumulative: '
+                                  f'{self.pp_vivified_literals} literals / '
+                                  f'{self.pp_vivified_cuts} cuts).')
+                        else:
+                            print('Phase probing vivification skipped: relu '
+                                  'key mapping mismatch.')
+                    # ----------------- phase probing end ------------------
+
                     add_cuts_time = time.time() # record the inference time
                     # check the unique and redundant cuts
                     # here self.biccos_cuts is a list contains all the inferred cuts
@@ -198,9 +232,26 @@ class BICCOS:
             if new_cplex_cuts is not None:
                 self.cplex_cuts = new_cplex_cuts
 
-        if unique_cuts_num > 0 or new_cplex_cuts:
+        # ---------------- phase probing start ----------------
+        # Implied-bound cuts emitted by phase probing (box-sound; see
+        # phase_probing._PhaseProber.emit_implied_cuts). They are kept in a
+        # pending list on the LiRPANet because this method OVERWRITES
+        # net.cutter.cuts below; re-appending them on every pool rebuild
+        # makes them persist. Their first installation also forces a cut
+        # module rebuild.
+        pp_pending_cuts = list(
+            getattr(net, 'phase_probing_pending_cuts', None) or [])
+        pp_need_install = bool(pp_pending_cuts) and not getattr(
+            net, 'phase_probing_cuts_installed', False)
+        # ----------------- phase probing end ------------------
+
+        if unique_cuts_num > 0 or new_cplex_cuts or pp_need_install:
             # We always include the most recent cplex cuts, otherwise they would be dropped.
-            net.cutter.cuts = self.biccos_cuts + self.cplex_cuts
+            net.cutter.cuts = self.biccos_cuts + self.cplex_cuts + pp_pending_cuts
+            if pp_need_install:
+                net.phase_probing_cuts_installed = True
+                print(f'{len(pp_pending_cuts)} phase-probing implied-bound '
+                      'cuts added to the cut pool.')
             if new_cplex_cuts:
                 net.net.cut_timestamp = cut_timestamp
                 print('BICCOS and MIP cuts are added to the cut module.')

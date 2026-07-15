@@ -245,11 +245,28 @@ class AlphaFullInfoData(DictLikeMixIn):
         raw_alpha_by_layer = {}
         optimizable_activations = net.net.get_enabled_opt_act()
 
+        # Phase probing (see LiRPANet.alpha_drop_unused): while extra
+        # intermediate-start-node alphas are retained on the net for the
+        # prober, alpha_drop_unused() above no longer removes them, so the
+        # extraction must filter down to the normal part scope
+        # (alpha_start_nodes) explicitly to keep the extracted data
+        # identical to the non-probing case. No-op otherwise.
+        keep = (set(net.alpha_start_nodes)
+                if getattr(net, 'phase_probing_keep_alpha_nodes', None)
+                else None)
+
         for m in optimizable_activations:
             if not move:
-                raw_alpha_by_layer[m.name] = m.dump_alpha()
+                data = m.dump_alpha()
             else:
-                raw_alpha_by_layer[m.name] = m.pop_alpha()
+                data = m.pop_alpha()
+            if keep is not None:
+                for field in ('alpha', 'alpha_lookup_idx'):
+                    if isinstance(data.get(field), dict):
+                        data[field] = type(data[field])(
+                            (k, v) for k, v in data[field].items()
+                            if k in keep)
+            raw_alpha_by_layer[m.name] = data
 
         return AlphaFullInfoData(_data=raw_alpha_by_layer)
 

@@ -75,6 +75,22 @@ def incomplete_verifier(
                     node.mode = "matrix"
     # --------------------- invprop end ---------------------
 
+    # ---------------- phase probing start ----------------
+    # Retain intermediate-start-node alphas through build()'s
+    # alpha_drop_unused() so the prober's alpha rung can recompute
+    # downstream bounds under a pin (alpha-quality hulls instead of
+    # crown-quality ones; see phase_probing.py and
+    # LiRPANet.alpha_drop_unused). The prober trims the retained set to its
+    # target layers and probe_and_refine releases everything before BaB, so
+    # BaB sees exactly the usual post-drop state. Gated so nothing changes
+    # when phase probing is off (or cannot use the alphas: crown-only
+    # oracle, or input split where probing does not engage).
+    if (arguments.Config["solver"]["phase_probing"]["enabled"]
+            and arguments.Config["solver"]["phase_probing"]["oracle"] != "crown"
+            and not arguments.Config["bab"]["branching"]["input_split"]["enable"]):
+        model.phase_probing_keep_alpha_nodes = 'all'
+    # ----------------- phase probing end ------------------
+
     # main function to build the model and perform incomplete verification
     global_lb, ret = model.build(
         x, c, rhs, stop_criterion, vnnlib_handler=self.vnnlib_handler,
@@ -104,6 +120,23 @@ def incomplete_verifier(
         return "safe-incomplete", {}
 
     ret = spec_handler.post_process(model, ret)
+
+    # ---------------- phase probing start ----------------
+    # Phase probing with hull-based bound refinement (see phase_probing.py):
+    # probes both phases of unstable ReLU neurons in GPU batches, refines
+    # ret's intermediate bounds in place (they flow into BaB as reference
+    # bounds), and may verify the property outright.
+    if arguments.Config["solver"]["phase_probing"]["enabled"]:
+        from phase_probing import probe_and_refine
+        # x, c, rhs, or_spec_size are the (joint) specification exactly as
+        # fed to model.build() above (spec_handler.x/c/rhs were deleted in
+        # post_process, but these locals still reference them).
+        probing_verified, _ = probe_and_refine(
+            model, x, c, rhs, or_spec_size, spec_handler, ret)
+        if probing_verified:
+            print('verified by phase probing!')
+            return "safe-incomplete", {}
+    # ----------------- phase probing end ------------------
 
     # -------------------- invprop start --------------------
     if tighten_input_bounds:

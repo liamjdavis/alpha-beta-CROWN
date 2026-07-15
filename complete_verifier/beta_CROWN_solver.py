@@ -1073,6 +1073,22 @@ class LiRPANet:
     def alpha_drop_unused(self):
         optimizable_activations = self.net.get_enabled_opt_act()
         keep_nodes = self.alpha_start_nodes
+        # Phase probing (see phase_probing.py): the prober's alpha rung
+        # reuses the build()-time intermediate-start-node alphas to
+        # recompute downstream bounds under a one-neuron pin (alpha-quality
+        # hulls). Those alphas are normally dropped right here. When
+        # `phase_probing_keep_alpha_nodes` is set (ONLY while phase probing
+        # is enabled: set before build() in incomplete_verifier_func.py,
+        # trimmed to the prober's target layers and finally cleared by
+        # probe_and_refine before BaB), the listed start nodes are retained;
+        # the sentinel 'all' retains every start node until the prober knows
+        # its targets. No behavior or memory change otherwise.
+        extra = getattr(self, 'phase_probing_keep_alpha_nodes', None)
+        if extra == 'all':
+            return
+        if extra:
+            keep_nodes = list(keep_nodes) + [
+                n for n in extra if n not in keep_nodes]
         for m in optimizable_activations:
             m.drop_unused_alpha(keep_nodes)
     from lp_mip_solver import (

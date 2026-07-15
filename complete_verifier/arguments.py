@@ -409,6 +409,60 @@ class ConfigHandler:
                           help='Shares gammas across neurons in the optimized layer.',
                           hierarchy = h + ['share_gammas'])
 
+        h = ["solver", "phase_probing"]
+        self.add_argument("--phase_probing", action='store_true', dest='phase_probing_enabled',
+                          help='Enable phase probing with hull-based bound refinement: after initial incomplete '
+                               'verification, probe both phases of unstable ReLU neurons (batched on GPU) and refine '
+                               'intermediate bounds with the elementwise hull across the two phases; spec-verified '
+                               'probe regions additionally force the opposite phase.',
+                          hierarchy=h + ["enabled"])
+        self.add_argument("--phase_probing_batch_size", type=int, default=256,
+                          help='Batch size for GPU-batched phase probes (each probe is one batch element with a '
+                               'one-neuron clamp in its intermediate bounds).',
+                          hierarchy=h + ["batch_size"])
+        self.add_argument("--no_phase_probing_forced_phases", dest='phase_probing_apply_forced_phases',
+                          action='store_false', default=True,
+                          help='Disable applying spec-conditional forced phases (one-sided clamps on root intermediate '
+                               'bounds) found by phase probing; only the always-sound hull refinement is applied.',
+                          hierarchy=h + ["apply_forced_phases"])
+        self.add_argument("--phase_probing_mip_confirm", action='store_true', dest='phase_probing_mip_confirm',
+                          help='Confirm each spec-conditional forced phase exactly by solving the pinned region with '
+                               'a Gurobi MIP model before applying it. Skipped gracefully if Gurobi is unavailable.',
+                          hierarchy=h + ["mip_confirm"])
+        self.add_argument("--phase_probing_max_neurons", type=int, default=0,
+                          help='Maximum number of unstable neurons to probe (0 = all unstable neurons). If positive, '
+                               'the top-N neurons ranked by the instability score |lb*ub|/(ub-lb) are probed.',
+                          hierarchy=h + ["max_neurons"])
+        self.add_argument("--phase_probing_oracle", type=str, default="crown",
+                          choices=["crown", "alpha", "beta", "gurobi"],
+                          help='Maximum rung of the probe oracle ladder. All probes run at rung "crown" (plain '
+                               'CROWN); near-miss probes escalate to "alpha" (reuse of the optimized alphas from the '
+                               'initial pass), then "beta" (beta-CROWN treating the pin as a one-split domain), then '
+                               '"gurobi" (exact MILP; skipped gracefully without a usable license).',
+                          hierarchy=h + ["oracle"])
+        self.add_argument("--phase_probing_escalate_margin_frac", type=float, default=0.5,
+                          help='Escalate a probe to the next oracle rung when its remaining output-margin deficit is '
+                               'within this fraction of the full-box deficit at the same rung (i.e. the probe closed '
+                               'at least (1 - frac) of the gap to verification).',
+                          hierarchy=h + ["escalate_margin_frac"])
+        self.add_argument("--phase_probing_escalate_hull_frac", type=float, default=0.05,
+                          help='Also escalate a probe pair whose hull refinement tightened some downstream neuron by '
+                               'at least this fraction of its original interval width.',
+                          hierarchy=h + ["escalate_hull_frac"])
+        self.add_argument("--phase_probing_implied_cuts_max", type=int, default=100,
+                          help='Maximum number of implied-bound GCP-CROWN cuts emitted from probe pairs '
+                               '(0 disables cut emission). Only used when bab cuts are enabled.',
+                          hierarchy=h + ["implied_cuts_max"])
+        self.add_argument("--phase_probing_implied_cuts_gap_frac", type=float, default=0.2,
+                          help='Emit an implied-bound cut for (pinned neuron i, neuron v) only when the gap between '
+                               'the two phase bounds of v exceeds this fraction of the original interval width of v.',
+                          hierarchy=h + ["implied_cuts_gap_frac"])
+        self.add_argument("--no_phase_probing_vivify_biccos", dest='phase_probing_vivify_biccos',
+                          action='store_false', default=True,
+                          help='Disable vivification (literal removal) of BICCOS blocking-clause cuts using the '
+                               'probe-derived phase implication graph.',
+                          hierarchy=h + ["vivify_biccos"])
+
         h = ["solver", "beta-crown"]
         self.add_argument("--lr_alpha", type=float, default=0.01,
                           help='Learning rate for optimizing alpha during branch and bound.',
