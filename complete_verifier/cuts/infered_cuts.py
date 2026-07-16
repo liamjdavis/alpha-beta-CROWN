@@ -200,6 +200,27 @@ class BICCOS:
                         else:
                             print('Phase probing vivification skipped: relu '
                                   'key mapping mismatch.')
+                    # Joint-pin descent vivification (GPU-batched entailment
+                    # probes; see phase_probing.ClauseVivifier). Runs after
+                    # the edge-graph pass so it only spends probes on
+                    # literals the cheap pass could not remove.
+                    pp_vivifier = getattr(net, 'phase_probing_vivifier', None)
+                    if pp_vivifier is not None and self.tmp_cuts:
+                        pp_vivifier.vivify(self.tmp_cuts, d)
+                    # Mirror the (possibly vivified) fresh blocking clauses
+                    # into the CPU SAT layer (see sat_layer.py). Clause
+                    # literal ints must be relu-layer indices, so this is
+                    # gated on key_mapping/relu alignment like the edge
+                    # vivification above.
+                    pp_sat = getattr(net, 'phase_probing_sat_layer', None)
+                    if pp_sat is not None and self.tmp_cuts:
+                        relus = net.net.relus
+                        if all(self.key_mapping.get(r.inputs[0].name) == i
+                               for i, r in enumerate(relus)):
+                            pp_sat.add_blocking_cuts(
+                                self.tmp_cuts,
+                                pp_sat.run_key_of(d.get('cs'),
+                                                  d.get('thresholds')))
                     # ----------------- phase probing end ------------------
 
                     add_cuts_time = time.time() # record the inference time

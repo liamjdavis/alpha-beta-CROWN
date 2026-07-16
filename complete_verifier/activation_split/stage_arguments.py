@@ -44,6 +44,8 @@ class PreprocessConstArguments:
     "The device the preprocess is bound to."
     unstable_mask: dict[str, Tensor]
     "The mask for unstable activations in each layer"
+    sat_layer: object = None
+    "Phase-probing SAT layer (sat_layer.PhaseSATLayer) or None."
 
     @staticmethod
     def from_net(net: LiRPANet) -> "PreprocessConstArguments":
@@ -53,7 +55,8 @@ class PreprocessConstArguments:
             net_x=net.x,
             net_c=net.c,
             device=str(net.device),
-            unstable_mask=net.unstable_mask
+            unstable_mask=net.unstable_mask,
+            sat_layer=getattr(net, 'phase_probing_sat_layer', None)
         )
 
 @dataclass

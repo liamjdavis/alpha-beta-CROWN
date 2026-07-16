@@ -462,6 +462,38 @@ class ConfigHandler:
                           help='Disable vivification (literal removal) of BICCOS blocking-clause cuts using the '
                                'probe-derived phase implication graph.',
                           hierarchy=h + ["vivify_biccos"])
+        self.add_argument("--phase_probing_vivify_joint", action='store_true',
+                          dest='phase_probing_vivify_joint',
+                          help='Joint-pin descent vivification of BICCOS blocking clauses: pin the negations of a '
+                               'literal prefix simultaneously (a multi-split BaB domain view) and recompute the output '
+                               'bound; a verified pinned region entails the prefix disjunction, which replaces the '
+                               'clause. Requires phase probing to be enabled.',
+                          hierarchy=h + ["vivify_joint"])
+        self.add_argument("--phase_probing_vivify_grade", type=str, default="beta",
+                          choices=["crown", "alpha", "beta"],
+                          help='Bound grade of the joint-pin vivification oracle: "crown" (plain CROWN backward), '
+                               '"alpha" (reuse of the build-time final-start-node alphas) or "beta" (beta-CROWN over '
+                               'the pin set as a multi-split BaB domain -- the grade BICCOS itself verified the '
+                               'clauses at; measured 0-percent hit rate for the cheaper grades).',
+                          hierarchy=h + ["vivify_grade"])
+        self.add_argument("--phase_probing_vivify_max_lits", type=int, default=32,
+                          help='Only test literal prefixes up to this length during joint-pin vivification.',
+                          hierarchy=h + ["vivify_max_lits"])
+        self.add_argument("--phase_probing_vivify_budget", type=int, default=8192,
+                          help='Total joint-pin vivification probes per verification instance (amortized over all '
+                               'BICCOS cut-inference rounds).',
+                          hierarchy=h + ["vivify_budget"])
+        self.add_argument("--phase_probing_vivify_iterations", type=int, default=0,
+                          help='Optimizer iterations per beta-grade vivification probe chunk (joint alpha/beta/'
+                               'cut-beta optimization on the pinned domains). 0 = inherit solver:beta-crown:iteration.',
+                          hierarchy=h + ["vivify_iterations"])
+        self.add_argument("--phase_probing_sat_layer", action='store_true',
+                          dest='phase_probing_sat_layer',
+                          help='CPU-side clause database over ReLU phase literals (PySAT/CaDiCaL) mirroring probe '
+                               'implication edges, forced phases and BICCOS clauses; unit-propagates every picked '
+                               'BaB domain to prune falsified domains before any bound computation and to clamp '
+                               'propagation-implied phases. Requires phase probing to be enabled.',
+                          hierarchy=h + ["sat_layer"])
 
         h = ["solver", "beta-crown"]
         self.add_argument("--lr_alpha", type=float, default=0.01,

@@ -1051,6 +1051,442 @@ def vivify_biccos_cuts(cuts, implications_int, forced_int):
     return removed, shortened
 
 
+class ClauseVivifier:
+    """Joint-pin descent vivification of BICCOS blocking clauses.
+
+    A BICCOS blocking clause is a disjunction OR_i L_i over ReLU phase
+    literals (see vivify_biccos_cuts for the encoding). For a PREFIX of j
+    literals, pin the negations of all j literals simultaneously -- multi-
+    neuron clamps in one domain with every intermediate bound fixed, i.e. a
+    j-split BaB domain view -- and recompute the output lower bound. If the
+    pinned region is verified (contains no counterexample of THIS
+    specification), then L_1 OR ... OR L_j is entailed on the
+    counterexample-relevant region and REPLACES the clause: a strictly
+    stronger cut with the same conditionality BICCOS cuts already have.
+
+    Negative result ported from the Marabou side of this project: testing
+    literals via intersections of stored SINGLE-pin probe bounds is dead
+    (0 removals in ~49k checks there); the pins must be propagated JOINTLY,
+    which is what the batched compute_bounds below does.
+
+    CONDITIONING (important): BaB runs once per unverified OR group with a
+    single-clause specification (d['cs']); BICCOS clauses learned in that
+    run are entailed w.r.t. THAT clause only. The probes therefore use the
+    picked domains' cs/thresholds -- testing against the full multi-group
+    spec would demand entailment the clauses never had (measured: 0
+    shortenings at both crown and beta grade before this fix).
+
+    All (clause, prefix) candidates of one cut-inference round are batched
+    into as few GPU calls as possible. Literals are ordered
+    most-tightening-first (probe hull gain, then root instability score) so
+    short prefixes carry the strongest pins. Probes run at cfg
+    ['vivify_grade']: 'crown' is a plain backward pass; 'alpha' reuses the
+    net's CURRENT final-start-node alphas (sliced to batch 1, broadcast
+    over the probe batch -- they are spec-consistent with this BaB run);
+    'beta' additionally enforces the pins with SparseBeta Lagrangians and
+    optimizes over the probe batch WITH the GCP-CROWN cut pool, the exact
+    grade BICCOS re-verified the clauses at. Around every chunk the net's
+    beta/cut state is swapped out and restored -- stale batch-mismatched
+    state would otherwise leak into the probe (see backward_bound.py's
+    enable_beta_crown gate and BoundRelu.cut_used).
+
+    Constructed at probe time (_probe_and_refine) because it needs the
+    refined root bounds and the probe hull-gain ordering data; stashed on
+    the LiRPANet and consumed by BICCOS.update_cut. Everything heavy is
+    kept on the CPU between calls.
+    """
+
+    def __init__(self, prober, model):
+        cfg = arguments.Config['solver']['phase_probing']
+        self.model = model
+        self.net = model.net
+        self.device = model.device
+        self.final_name = model.final_name
+        self.x = prober.x
+        self.grade = cfg['vivify_grade']
+        self.max_lits = cfg['vivify_max_lits']
+        self.budget = cfg['vivify_budget']
+        # Optimizer iterations per beta-grade probe chunk -- the dominant
+        # strength-vs-cost knob of the oracle (final alphas / SparseBetas /
+        # cut betas are re-optimized per probe from the parent-slice warm
+        # start). 0 = inherit solver:beta-crown:iteration.
+        self.iterations = (cfg['vivify_iterations']
+                           if cfg['vivify_iterations'] > 0 else
+                           arguments.Config['solver']['beta-crown']
+                           ['iteration'])
+        self.batch_size = max(2, cfg['batch_size'])
+        self.interm_names = list(prober.interm_names)
+        self.preact_of_relu_idx = {
+            v: k for k, v in prober.relu_idx_of_preact.items()}
+        # Refined root bounds (the bounds BaB starts from; forced-phase
+        # clamps included -- spec-conditional like the clauses themselves).
+        self.base_lb = {k: prober.ref_lb[k].detach().cpu()
+                        for k in self.interm_names}
+        self.base_ub = {k: prober.ref_ub[k].detach().cpu()
+                        for k in self.interm_names}
+        # Literal ordering data: probe hull gain (primary), instability
+        # score of the refined root bounds (secondary).
+        self.pair_gain = {}
+        for (layer, nidx), g in prober.pair_gain.items():
+            ridx = prober.relu_idx_of_preact.get(layer)
+            if ridx is not None:
+                self.pair_gain[(ridx, nidx)] = g
+        self.split_node_names = [n.name for n in self.net.split_nodes]
+        # Per-vivify-call spec (this BaB run's clause) -- see vivify().
+        self.cur_c, self.cur_rhs = None, None
+        self.stats = {
+            'pool': 0, 'eligible': 0, 'shortened': 0, 'removed_lits': 0,
+            'removed_root': 0, 'probes': 0, 'full_verified': 0,
+            'full_tested': 0, 'gpu_time': 0.0, 'skipped_multi_c': 0,
+            'len_hist': {},  # eligible clause length -> count
+        }
+
+    # -- clause parsing -------------------------------------------------
+
+    def _parse(self, cut):
+        """Blocking clause -> ordered literal list [(ridx, nidx, sign)]
+        with sign = arelu coefficient = the phase pinned by the literal's
+        NEGATION (+1 active / -1 inactive), or None if not eligible.
+        Root-stable literals are screened out CPU-side first:
+        a literal false at the root is removable unconditionally; a literal
+        true at the root makes the whole clause tautological (skipped)."""
+        if cut.get('x_decision') or cut.get('relu_decision') \
+                or cut.get('pre_decision') or cut.get('c') != -1:
+            return None, 0
+        signs = [1 if s > 0 else -1 for s in cut['arelu_coeffs']]
+        npos = sum(1 for s in signs if s > 0)
+        if abs(float(cut['bias']) - (npos - 1)) > 1e-6:
+            return None, 0
+        lits, removed_root = [], 0
+        seen = set()
+        for (ridx, nidx), s in zip(cut['arelu_decision'], signs):
+            name = self.preact_of_relu_idx.get(ridx)
+            if name is None or (ridx, nidx) in seen:
+                return None, 0  # unknown layer / duplicated neuron: skip
+            seen.add((ridx, nidx))
+            lb = float(self.base_lb[name].view(-1)[nidx])
+            ub = float(self.base_ub[name].view(-1)[nidx])
+            if (s > 0 and ub <= 0) or (s < 0 and lb >= 0):
+                # Literal TRUE at the root: clause is a tautology.
+                return None, 0
+            if (s > 0 and lb >= 0) or (s < 0 and ub <= 0):
+                removed_root += 1  # literal FALSE at the root: drop it
+                continue
+            width = max(ub - lb, 1e-12)
+            instab = abs(lb * ub) / width
+            lits.append((self.pair_gain.get((ridx, nidx), 0.), instab,
+                         ridx, nidx, s))
+        lits.sort(key=lambda t: (-t[0], -t[1]))
+        return [(r, n, s) for _, _, r, n, s in lits], removed_root
+
+    @staticmethod
+    def _rewrite(cut, lits):
+        """Replace the clause by the given literal list (same wire format,
+        decisions sorted the way BICCOS emits them)."""
+        merged = sorted(([r, n], float(s)) for r, n, s in lits)
+        cut['arelu_decision'] = [d for d, _ in merged]
+        cut['arelu_coeffs'] = [c for _, c in merged]
+        cut['bias'] = float(sum(1 for _, c in merged if c > 0) - 1)
+
+    # -- GPU probe execution --------------------------------------------
+
+    def _pinned_interm_bounds(self, pins_per_probe):
+        """Batched interm_bounds with every layer fixed at the refined root
+        value and the pinned neurons clamped per batch element."""
+        B = len(pins_per_probe)
+        pinned_layers = set()
+        for pins in pins_per_probe:
+            for (ridx, _, _) in pins:
+                pinned_layers.add(self.preact_of_relu_idx[ridx])
+        probe_ib = {}
+        for k in self.interm_names:
+            lb = self.base_lb[k].to(self.device)
+            ub = self.base_ub[k].to(self.device)
+            if k in pinned_layers:
+                rep = [B] + [1] * (lb.dim() - 1)
+                probe_ib[k] = [lb.repeat(*rep), ub.repeat(*rep)]
+            else:
+                probe_ib[k] = [lb.expand(B, *lb.shape[1:]),
+                               ub.expand(B, *ub.shape[1:])]
+        for j, pins in enumerate(pins_per_probe):
+            for (ridx, nidx, sign) in pins:
+                name = self.preact_of_relu_idx[ridx]
+                if sign > 0:
+                    probe_ib[name][0].view(B, -1)[j, nidx] = 0.  # pin ACTIVE
+                else:
+                    probe_ib[name][1].view(B, -1)[j, nidx] = 0.  # pin INACTIVE
+        return probe_ib
+
+    def _verified(self, lb_out):
+        """lb_out: [B, spec] output lower bounds on the pinned regions.
+        Verified against THIS BaB run's clause set: any clause margin > rhs
+        (stop_criterion_batch_any, BaB's own criterion for these runs)."""
+        return (lb_out > self.cur_rhs.to(lb_out)).any(dim=1)
+
+    def _run_chunk(self, pins_per_probe):
+        """One batched probe over pins_per_probe: list (len B) of pin lists
+        [(ridx, nidx, sign)]. Returns verified[B]."""
+        if self.grade == 'beta':
+            return self._run_chunk_beta(pins_per_probe)
+        B = len(pins_per_probe)
+        probe_ib = self._pinned_interm_bounds(pins_per_probe)
+        new_x = expand_batch(self.x, B, device=self.device)
+        C = self.cur_c.expand(B, -1, -1)
+        lb_out = self.net.compute_bounds(
+            x=(new_x,), C=C, method='backward',
+            reuse_alpha=(self.grade == 'alpha'),
+            interm_bounds=probe_ib, bound_upper=False)[0]
+        return self._verified(lb_out)
+
+    def _run_chunk_beta(self, pins_per_probe):
+        """Beta-CROWN probe chunk: the pin set is expressed BOTH as clamped
+        intermediate bounds and as a multi-entry split history whose
+        SparseBeta enforces the split constraints via the Lagrangian --
+        exactly a multi-split BaB domain, the same grade BICCOS verified
+        the clause's source domain at (generalizes _PhaseProber's beta rung
+        from one pin to several)."""
+        B = len(pins_per_probe)
+        probe_ib = self._pinned_interm_bounds(pins_per_probe)
+        empty = {name: ([], [], [], [], []) for name in self.split_node_names}
+        history = []
+        for pins in pins_per_probe:
+            h = dict(empty)
+            by_layer = {}
+            for (ridx, nidx, sign) in pins:
+                by_layer.setdefault(
+                    self.preact_of_relu_idx[ridx], []).append((nidx, sign))
+            for name, entries in by_layer.items():
+                k = len(entries)
+                h[name] = ([n for n, _ in entries], [s for _, s in entries],
+                           [0.] * k, [0.] * k, [1] * k)
+            history.append(h)
+        d = {'history': history, 'betas': [None] * B}
+        beta_data, _ = BetaFullData.from_domain_dict(
+            d, bias=True, device=self.device)
+        beta_data.attach_to_net(self.model)
+
+        # Repeat the batch-1 slice of the net's current final alphas
+        # (stashed by _swap_net_state) to the probe batch -- from the SLICE,
+        # not from m.alpha, which the previous chunk overwrote with its own
+        # batch size. All intermediate bounds are fixed, so only these are
+        # optimized.
+        for m in self.net.get_enabled_opt_act():
+            a = self._alpha_slice.get(m.name)
+            if a is not None:
+                rep = [1, 1, B] + [1] * (a.dim() - 3)
+                m.alpha[self.final_name] = \
+                    a.repeat(*rep).requires_grad_(True)
+
+        new_x = expand_batch(self.x, B, device=self.device)
+        C = self.cur_c.expand(B, -1, -1)
+
+        def never_stop(x):
+            # Run all iterations; per-element early stopping would need the
+            # OR-group logic which the optimizer cannot use.
+            return torch.zeros(x.shape[0], 1, dtype=torch.bool,
+                               device=x.device)
+
+        # set_crown_bound_opts FIRST: it stamps lr/iteration from the
+        # config, so the probe-specific opts (in particular the
+        # vivify_iterations override) must be applied AFTER it.
+        self.model.set_crown_bound_opts('beta')
+        self.net.set_bound_opts({
+            'optimize_bound_args': {
+                'enable_beta_crown': True,
+                'fix_interm_bounds': True,
+                'stop_criterion_func': never_stop,
+                'multi_spec_keep_func': None,
+                'iteration': self.iterations,
+            },
+            'enable_opt_interm_bounds': False,
+        })
+        # Verify WITH the GCP-CROWN cut pool, exactly like BICCOS's own
+        # clause re-verification (biccos_verification): pool cuts are
+        # entailed on the counterexample-relevant region of THIS spec, so
+        # they may strengthen the probe. Fresh zero-init general betas per
+        # chunk; BaB re-installs its own via set_cut_params next round
+        # (the same overwrite biccos_verification already does).
+        use_cuts = (getattr(self.net, 'cut_module', None) is not None
+                    and arguments.Config['bab']['cut']['bab_cut'])
+        if use_cuts:
+            self.net.cut_used = True
+            self.model.set_cut_params(B, B, None)
+        with torch.enable_grad():
+            lb_out = self.net.compute_bounds(
+                x=(new_x,), C=C, method='CROWN-optimized',
+                interm_bounds=probe_ib, bound_upper=False,
+                cutter=self.model.cutter if use_cuts else None)[0]
+        if use_cuts:
+            # _swap_net_state's undo restores the pre-vivify cut flags.
+            self.net.cut_used = False
+            for m in self.net.splittable_activations:
+                m.cut_used = False
+        return self._verified(lb_out.detach())
+
+    def _probe_all(self, cand_pins):
+        """Run all candidates through _run_chunk with OOM backoff.
+        Returns list of bool (verified), aligned with cand_pins."""
+        results = []
+        pos, cur = 0, self.batch_size
+        while pos < len(cand_pins):
+            chunk = cand_pins[pos:pos + cur]
+            try:
+                verified = self._run_chunk(chunk)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if not _is_oom(e):
+                    raise
+                torch.cuda.empty_cache()
+                if cur == 1:
+                    raise
+                cur = max(1, cur // 2)
+                print('Phase probing joint vivification: CUDA OOM, reducing '
+                      f'chunk to {cur} probes.')
+                continue
+            results.extend(bool(v) for v in verified)
+            pos += len(chunk)
+        return results
+
+    def _swap_net_state(self):
+        """Slice the net's current final-start-node alphas to batch 1
+        (a valid warm start for any pinned subregion, spec-consistent with
+        this BaB run's clause) and disable beta/cut terms. Returns an undo
+        closure restoring the exact previous state."""
+        saved_alpha, saved_nonfinal = {}, {}
+        self._alpha_slice = {}
+        acts = {m.name: m for m in self.net.get_enabled_opt_act()}
+        if self.grade in ('alpha', 'beta'):
+            for name, m in acts.items():
+                a = m.alpha.get(self.final_name) \
+                    if hasattr(m, 'alpha') else None
+                if isinstance(a, torch.Tensor) and a.dim() >= 3 \
+                        and a.shape[2] >= 1:
+                    saved_alpha[name] = a
+                    self._alpha_slice[name] = a[:, :, :1].detach().clone()
+                    m.alpha[self.final_name] = self._alpha_slice[name]
+        if self.grade == 'beta':
+            # Stash every non-final-start-node alpha for the duration of
+            # the probes: the optimizer's best-alpha bookkeeping indexes ALL
+            # alpha entries by the probe batch dim, and any retained entries
+            # with a different batch dim trigger a device-side assert (see
+            # _PhaseProber.run_beta_rung).
+            for name, m in acts.items():
+                for spec in [s for s in m.alpha
+                             if s != self.final_name]:
+                    saved_nonfinal.setdefault(name, {})[spec] = \
+                        m.alpha.pop(spec)
+        prev_beta = self.net.bound_opts['optimize_bound_args'][
+            'enable_beta_crown']
+        self.net.set_bound_opts(
+            {'optimize_bound_args': {'enable_beta_crown': False}})
+        prev_cut_net = getattr(self.net, 'cut_used', False)
+        prev_cut_act = {m.name: m.cut_used
+                        for m in self.net.splittable_activations}
+        self.net.cut_used = False
+        for m in self.net.splittable_activations:
+            m.cut_used = False
+
+        def undo():
+            for name, a in saved_alpha.items():
+                acts[name].alpha[self.final_name] = a
+            for name, entries in saved_nonfinal.items():
+                acts[name].alpha.update(entries)
+            self.net.set_bound_opts(
+                {'optimize_bound_args': {'enable_beta_crown': prev_beta}})
+            self.net.cut_used = prev_cut_net
+            for m in self.net.splittable_activations:
+                if m.name in prev_cut_act:
+                    m.cut_used = prev_cut_act[m.name]
+        return undo
+
+    # -- entry point -----------------------------------------------------
+
+    def vivify(self, cuts, d):
+        """Joint-pin descent over freshly inferred blocking clauses.
+        `cuts` is modified in place; `d` is the picked-domain batch dict
+        whose cs/thresholds define THIS BaB run's clause (the conditioning
+        of the cuts). Prints per-call and cumulative stats."""
+        st = self.stats
+        st['pool'] += len(cuts)
+        if self.budget <= 0:
+            return
+        cs, rhs = d.get('cs'), d.get('thresholds')
+        if not isinstance(cs, torch.Tensor) or cs.numel() == 0 \
+                or not isinstance(rhs, torch.Tensor):
+            return
+        if not bool((cs == cs[:1]).all()) or not bool((rhs == rhs[:1]).all()):
+            # Heterogeneous specs in one batch (jointly optimized OR
+            # groups): per-clause conditioning is ambiguous, skip.
+            st['skipped_multi_c'] += 1
+            return
+        self.cur_c = cs[:1].detach().to(self.device)
+        self.cur_rhs = rhs[:1].detach()
+        # Parse + screen CPU-side; collect (cut, ordered lits, prefix js).
+        jobs, cand_pins, cand_key = [], [], []
+        for cut in cuts:
+            lits, removed_root = self._parse(cut)
+            if lits is None:
+                continue
+            if removed_root and lits:
+                self._rewrite(cut, lits)
+                st['removed_lits'] += removed_root
+                st['removed_root'] += removed_root
+                st['shortened'] += 1
+            n = len(lits)
+            if n < 2 or n > self.max_lits:
+                continue
+            st['eligible'] += 1
+            st['len_hist'][n] = st['len_hist'].get(n, 0) + 1
+            job_id = len(jobs)
+            jobs.append((cut, lits))
+            # Prefixes j = 1..n-1 shorten; j = n is the grade-adequacy
+            # diagnostic (a clause whose FULL pin set does not verify at
+            # this grade can never shorten here).
+            for j in range(1, n + 1):
+                if len(cand_pins) >= self.budget:
+                    break
+                # Pin the NEGATIONS of the prefix literals: the negation
+                # of the literal for coefficient s is "phase(s)".
+                cand_pins.append(list(lits[:j]))
+                cand_key.append((job_id, j))
+        if not cand_pins:
+            return
+        t0 = time.time()
+        undo = self._swap_net_state()
+        try:
+            with torch.no_grad():
+                results = self._probe_all(cand_pins)
+        finally:
+            undo()
+        self.budget -= len(cand_pins)
+        st['probes'] += len(cand_pins)
+        st['gpu_time'] += time.time() - t0
+        # Fold results: minimal verified prefix per clause.
+        min_j = {}
+        for (job_id, j), ok in zip(cand_key, results):
+            n = len(jobs[job_id][1])
+            if j == n:
+                st['full_tested'] += 1
+                st['full_verified'] += bool(ok)
+            if ok and j < n:
+                min_j[job_id] = min(min_j.get(job_id, n), j)
+        for job_id, j in min_j.items():
+            cut, lits = jobs[job_id]
+            st['removed_lits'] += len(lits) - j
+            st['shortened'] += 1
+            self._rewrite(cut, lits[:j])
+        print('Phase probing joint vivification: '
+              f'{len(min_j)} of {len(jobs)} clauses shortened this round '
+              f'({len(cand_pins)} probes, {time.time() - t0:.2f}s); '
+              f"cumulative: pool={st['pool']}, eligible={st['eligible']}, "
+              f"shortened={st['shortened']}, "
+              f"literals_removed={st['removed_lits']} "
+              f"(root-screened {st['removed_root']}), "
+              f"full-pin verified {st['full_verified']}/{st['full_tested']}, "
+              f"probes={st['probes']}, gpu_time={st['gpu_time']:.2f}s, "
+              f'budget_left={self.budget}, '
+              f"len_hist={dict(sorted(st['len_hist'].items()))}")
+
+
 def probe_and_refine(model, x, c, rhs, or_spec_size, spec_handler, ret):
     """Wrapper around _probe_and_refine (see its docstring) that ALWAYS
     releases the alphas retained through build() for the alpha rung
@@ -1337,6 +1773,28 @@ def _probe_and_refine(model, x, c, rhs, or_spec_size, spec_handler, ret):
         stats['implied_cuts'] = len(model.phase_probing_pending_cuts)
         print(f'Phase probing: emitted {stats["implied_cuts"]} implied-bound '
               'cuts (pending until the cut module is built).')
+    if cfg['vivify_joint'] and arguments.Config['bab']['cut']['enabled']:
+        # Joint-pin descent vivifier for BICCOS clauses (see ClauseVivifier);
+        # consumed by BICCOS.update_cut on every cut-inference round.
+        model.phase_probing_vivifier = ClauseVivifier(prober, model)
+        print('Phase probing: joint-pin clause vivifier armed '
+              f'(grade {model.phase_probing_vivifier.grade}, '
+              f"budget {cfg['vivify_budget']} probes).")
+    if cfg['sat_layer']:
+        # CPU clause DB over phase literals (see sat_layer.py); filters
+        # picked BaB domains by unit propagation, fed by BICCOS.update_cut.
+        try:
+            from sat_layer import PhaseSATLayer
+            model.phase_probing_sat_layer = PhaseSATLayer(
+                model, prober.implication_edges_int(),
+                {(prober.relu_idx_of_preact[layer], nidx):
+                    (+1 if phase == 'active' else -1)
+                 for (layer, nidx), phase in
+                 (forced.items() if apply_forced else [])
+                 if layer in prober.relu_idx_of_preact},
+                {v: k for k, v in prober.relu_idx_of_preact.items()})
+        except ImportError as e:
+            print(f'Phase probing: SAT layer unavailable ({e}), skipping.')
     if cfg['vivify_biccos']:
         model.phase_probing_implications_int = prober.implication_edges_int()
         model.phase_probing_forced_int = {

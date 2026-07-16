@@ -390,12 +390,33 @@ def act_split_round(
     net.domain_interm_factory.construct_interm_bounds_in_d(d, net.unstable_mask)
     stats.timer.add("pickout")
 
+    # ---------------- phase probing start ----------------
+    # CPU SAT-layer filter (see sat_layer.py): unit-propagate every picked
+    # domain's phase assignment against the clause DB; falsified domains
+    # are pruned BEFORE any bound computation, propagation-implied phases
+    # are clamped into the domain bounds.
+    pp_sat = getattr(net, "phase_probing_sat_layer", None)
+    skip_split = False
+    if pp_sat is not None:
+        from sat_layer import select_domain_batch
+        keep, _ = pp_sat.process_picked_domains(
+            d, pp_sat.run_key_of(d.get("cs"), d.get("thresholds")))
+        if keep is not None:
+            if len(keep) == 0:
+                print("Phase probing SAT layer: entire picked batch pruned.")
+                skip_split = True
+            elif not select_domain_batch(d, keep):
+                print("Phase probing SAT layer: unknown batch structure, "
+                      "batch left unfiltered.")
+    # ----------------- phase probing end ------------------
+
     # when cplex cut is enabled, for domains with general_beta created for outdated cuts,
     # we need to rewrite it to general_beta for new cuts
     if bab_args["cut"]["enabled"] and bab_args["cut"]["cplex_cuts"]:
         cplex_update_general_beta(net, d)
 
-    split_domain(
+    if not skip_split:
+        split_domain(
         net,
         domains,
         d,

@@ -62,6 +62,26 @@ def branch_and_bound_preprocess(
     )
     stats.timer.add("pickout")
 
+    # ---------------- phase probing start ----------------
+    # CPU SAT-layer filter (see sat_layer.py): unit-propagate every picked
+    # domain's phase assignment; falsified domains are pruned before any
+    # bound computation, implied phases are clamped into the bounds. This
+    # pipeline cannot skip a round, so when the WHOLE batch is falsified
+    # one domain is kept (its bounding is wasted, its children stay
+    # filterable next round).
+    pp_sat = const_args.sat_layer
+    if pp_sat is not None:
+        from sat_layer import select_domain_batch
+        keep, _ = pp_sat.process_picked_domains(
+            d, pp_sat.run_key_of(d.get("cs"), d.get("thresholds")))
+        if keep is not None:
+            if len(keep) == 0:
+                keep = [0]
+            if not select_domain_batch(d, keep):
+                print("Phase probing SAT layer: unknown batch structure, "
+                      "batch left unfiltered.")
+    # ----------------- phase probing end ------------------
+
     stats.timer.start("decision")
     stats.timer.start("branching_decision")
 
