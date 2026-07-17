@@ -133,9 +133,10 @@ control command (no probing flags, no cuts) gives safe 25–26s on idx0
 with zero phase-probing/SAT/vivification output — matching the pre-edit
 baseline (safe 26–29s).
 
-Strongest measured treated variant (see the closed-loop and BCP sections
-below): add `--phase_probing_vivify_use_cuts pool
---phase_probing_vivify_bcp` to the treated arm.
+Strongest measured treated variant (see the closed-loop, BCP and
+mirror-oracle sections below): add `--phase_probing_vivify_use_cuts pool
+--phase_probing_mirror --phase_probing_vivify_dry_rounds 3` to the
+treated arm (`--phase_probing_vivify_bcp` is superseded by the mirror).
 
 Ablations: drop `--phase_probing_sat_layer` for vivification-only; drop
 `--phase_probing_vivify_joint` for SAT-layer-only (the SAT DB then holds
@@ -437,6 +438,28 @@ verifies — so vivification correctly certifies them minimal. Cost is
 ~4–5 ms/probe throughout; the whole-oracle budget of 8192 probes was
 never exhausted.
 
+### `max_neurons` sweep (full stack + valve, idx0, 2026-07-16)
+
+More probing = more facts = less search, but probe cost is SUPERLINEAR
+(5× per 2× neurons) with the current implementation:
+
+| N | probe GPU | escalated | edges / implied cuts | run-3 visited | wall | verdict |
+|---|---|---|---|---|---|---|
+| 64 | 8.3s (13% of wall) | 54 | 19 / 0 | 2106 | 62.4s | safe |
+| 128 | 42.6s (44%) | 118 | 34 / 8 | **1572 (−25%)** | 97.6s | safe |
+| 256 | 101.8s | 246 | 67 / 16 | truncated | 142.4s | unknown |
+| 512 | 235.3s | 616 | 143 / 28 | truncated | 276.5s | unknown |
+
+The N=128 arm proves the information channel scales (search −25%,
+implied cuts appear); the cost blowup is an artifact, not intrinsic:
+(a) escalation count scales with N — beyond the top-64, nearly every
+probe is a "near miss" at default escalate fracs; (b) probes are
+chunked PER PINNED LAYER — top-512 neurons spread across all layers,
+so batch-128 GPU calls run nearly empty. Prerequisites for raising N
+on the cluster: cross-layer probe packing + escalation budget cap,
+then budget-scaled N (roadmap item 1). Until then: N=64 for
+~100s-budget families, N=128 only where timeouts are long.
+
 ## CPU SAT layer (`sat_layer.py`)
 
 A clausal mirror of every phase fact, in PySAT with the CaDiCaL backend
@@ -535,7 +558,116 @@ Vivification on this trajectory: 70/687 shortened, full-pin 192/687.
 7. Forced-phase hunting on small-deficit instances (where `mip_confirm`
    would finally have a behavioral test case).
 
-## Plan: the mirror-oracle port (from Marabou, 2026-07-16)
+## The mirror oracle (ported 2026-07-16, `--phase_probing_mirror`)
+
+The port plan below is now BUILT (duties 1–3; learner harvest deferred).
+`PhaseSATLayer` grew three mirror duties, all gated by
+`solver: phase_probing: mirror` (requires `sat_layer`); the flag also
+supersedes `vivify_bcp` (it force-enables the extras loop but replaces
+its conflict test):
+
+- **Assumption-core vivification** (`vivify_clause_pins`): per eligible
+  clause, ONE conflict-bounded `solve_limited(assumptions=pins)`
+  (conf_budget 200) BEFORE any GPU probe; on UNSAT the failed-assumption
+  core IS the shortened clause (arbitrary subset — not just a prefix,
+  which BCP/GPU descent structurally cannot produce). Mirror-shortened
+  clauses skip their GPU probes entirely. Self-refutation is impossible:
+  fresh clauses are mirrored into the DB only after their own attempt
+  (the `infered_cuts.py` ordering already guaranteed this).
+- **Per-run UNSAT certificate**: empty core (PySAT `get_core() -> None`)
+  = the run DB is boolean-unsat below the assumptions ⇒ THIS OR group
+  has no counterexample ⇒ verified. Delivered by pruning every
+  subsequently picked domain of the run (`process_picked_domains`
+  returns keep=[]) and skipping all further vivification probes.
+- **Failed-literal probing** (`failed_literal_pass`): after each clause
+  batch lands in `add_blocking_cuts`, gated on DB growth >= 32 clauses
+  (Marabou's gate) and a 1s cap: `propagate([lit])` both signs per known
+  var; a conflict makes the negation a run-scoped forced phase (unit in
+  the run DB). Sees everything BICCOS has learned — a fact source GPU
+  probing never has.
+
+Measured (canonical treated arm + `vivify_use_cuts pool`, mirror replacing
+bcp; single trajectories, verdict parity everywhere):
+
+| instance / arm | shortened | lits | zero-GPU shortened | GPU probes / s | oracle CPU | verdict |
+|---|---|---|---|---|---|---|
+| idx0 pool+bcp (baseline) | 115/693 | 116 | 0 | 1396 / 12.6 | 0.01s | safe 62.0s |
+| idx0 pool+mirror | 115/696 | 116 | 0 (696 calls, all SAT) | 1405 / 16.1 | 0.005s | safe 66.9s |
+| idx7 pool+bcp (baseline) | 223/954 | 252 | 148 (-176 lits) | 3977 / 30.8 | 0.04s | unknown 105.9s |
+| idx7 pool+mirror | **314/953** | **484** | **239 (-408 lits)** | 3479 / 22.6 | **0.006s** | unknown 103.5s |
+
+idx7: mirror cores dominate BCP exactly as in Marabou — +41% clauses,
++92% literals, 912 GPU probes skipped, GPU time -27%, at 6ms total CPU
+(253 of 953 solves UNSAT, 0 budget-outs). idx0 confirms the converse:
+a 2-literal pool with sparse clause interactions has NO boolean
+structure — all 696 solves SAT — its shortenings come entirely from the
+numeric cut pool. Failed-literal probing found 116 (idx0) / 12 (idx7)
+run-scoped forced phases for ~5ms. No UNSAT certificate fired on either
+instance (expect them on runs whose clause DB actually saturates).
+
+### SAT-derived facts as GCP-CROWN cuts (`pop_new_cut_facts`, 2026-07-16)
+
+Delivery upgrade (user insight: don't just prune picked domains —
+feed the boolean facts into the RELAXATION so every subproblem
+tightens): failed-literal units (1-literal blocking cuts, run-scoped =
+exactly the BICCOS pool's own scoping since the cutter is rebuilt per
+BaB bootstrap) and, once per run, the persistent probe implication
+edges (box-sound 2-literal clause cuts) are exported in blocking-cut
+wire format and appended to `tmp_cuts` right after the SAT mirror pass
+in `BICCOS.update_cut` — they ride the normal pool → cut-module →
+optimized-multiplier path, and in `pool` mode they also strengthen the
+vivification oracle. 1-literal arelu cuts are a form BICCOS itself
+already emits (post-strengthening), so the module path is proven.
+
+Safety valve (`--phase_probing_fact_cuts_max`, default 50): every
+installed cut is a general-beta constraint optimized per domain, so
+fact cuts respect a number_cuts-style per-run budget — units first
+(a forced phase is the strongest clause cut), edges fill the rest;
+0 disables injection. UPSTREAM FINDING (2026-07-16): BICCOS's own
+`number_cuts` cap is leaky — `biccos_cuts[:max_cuts_num+1]` truncation
+only runs in the "Stop inferring" branch (`infered_cuts.py` ~line 264);
+during active inference `merge_cuts` grows the pool unbounded and
+`net.cutter.cuts = biccos_cuts + cplex + pending` installs ALL of it
+(measured: 213 installed cuts on idx7 at default number_cuts=50). Not
+changed here (it would alter the control arm); flag if cut-count
+overhead shows up in cluster profiles.
+
+### GPU dry-round gate (`--phase_probing_vivify_dry_rounds N`)
+
+Takes GPU out of the loop when it stops paying (the "delegate to the
+fast SAT solver" direction): after N consecutive vivify rounds in which
+GPU probes shortened nothing beyond the zero-GPU passes (mirror cores /
+BCP conflicts), GPU probes are gated OFF for the rest of that BaB run —
+mirror/FLP/domain-filter duties keep running (they are microseconds).
+Default 0 = off. Motivation measured on idx0: 16s GPU total with most
+late rounds at 0 shortenings for ~1s GPU each.
+
+### Full new stack measured (mirror + fact cuts + dry_rounds 3, 2026-07-16)
+
+Single trajectories, canonical pool arm + the three new pieces; verdict
+parity everywhere. Trajectories shift strongly (recovered GPU time goes
+to BaB — pool sizes and round counts are not comparable across arms;
+compare rates and GPU spend):
+
+| instance | shortened | mirror zero-GPU | vivify GPU | flp units | fact cuts | verdict |
+|---|---|---|---|---|---|---|
+| idx0 | 164/554 (29.6%) | 1 | **9.0s** (was 16.1 mirror-only, 12.6 bcp) | 86 | 9 rounds injected | safe 67.5s |
+| idx7 | 161/226 (71%!) | 88 (39% of eligible) | **3.1s** (was 22.6 mirror-only, 30.8 bcp) | 10 | 3 rounds | unknown 101.0s |
+
+The dry gate fired on both instances and is the dominant GPU saver
+(idx7 vivification GPU: 30.8s bcp-arm → 3.1s, a 10× reduction, while
+the shortened RATE rose to 71% because the mirror keeps working after
+the gate closes). idx0's wall time sits in the 62–77s jitter band of
+all treated arms; the instance-level win from the freed GPU must be
+read at cluster scale (or on budget-starved instances, where 13–27s of
+returned GPU is the difference between a verdict and a timeout — see
+roadmap item 1).
+
+## Plan: the mirror-oracle port (from Marabou, 2026-07-16) — DONE same day
+
+(Kept for the duty rationale and transferable laws; duties 1–3 are
+implemented and measured above. Duty 5 — learner harvest — remains
+deferred pending a PySAT Learner-interface workaround.)
 
 Marabou consolidated its entire boolean side into ONE extra CaDiCaL (the
 "mirror") holding only query-entailed clauses, with five duties. The SAT
@@ -618,11 +750,14 @@ regressions before building anything new.
    cluster round. The rescue-by-viv+SAT inversion suggests a trajectory
    effect, not a cost effect — compare per-instance wall times first to
    split cost-vs-trajectory.
-3. **Mirror-oracle duties on the SAT layer** (see the port plan above):
-   per-OR-group UNSAT certificates, boolean failed-literal probing,
-   get_core vivification — all zero-GPU, all runnable at EVERY BICCOS
-   round (the cadence advantage over Marabou). These directly reduce
-   overhead: each duty replaces GPU-milliseconds with CPU-microseconds.
+3. **Mirror-oracle duties on the SAT layer** — DONE 2026-07-16 (see the
+   mirror-oracle section): get_core vivification (+41% clauses / +92%
+   literals over BCP on idx7, 6ms CPU), failed-literal probing (86–116
+   units/instance), per-OR-group UNSAT certificate (built, not yet
+   observed firing), SAT-fact cuts into the pool, and the GPU dry-round
+   gate (idx7 vivify GPU 30.8s → 3.1s). Remaining from the plan:
+   learner harvest (duty 5, needs PySAT Learner access) and cluster
+   exposure of the new arm.
 4. **Per-parent-domain alphas for the vivify oracle** (the measured
    strength ceiling: 60–75% of full pins do not re-verify off stale
    batch-1 alpha slices). Only after 1–3: it ADDS GPU cost, so it needs

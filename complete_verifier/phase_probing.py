@@ -1124,6 +1124,18 @@ class ClauseVivifier:
         self.use_cuts_mode = cfg['vivify_use_cuts']
         # BCP pre-pass over the SAT layer's clause DB (see vivify()).
         self.bcp = cfg['vivify_bcp']
+        # Mirror oracle (supersedes the BCP conflict test with a
+        # conflict-bounded assumption-core solve; implies the extra-pin
+        # propagation of the BCP pass).
+        self.mirror = cfg['mirror']
+        if self.mirror:
+            self.bcp = True
+        # GPU dry-round gate: after this many consecutive rounds with no
+        # GPU-side shortening, stop spending GPU on this run (the CPU
+        # passes keep running). 0 = off.
+        self.dry_rounds = cfg['vivify_dry_rounds']
+        self._gpu_dry = 0
+        self._gpu_run_key = None
         self.batch_size = max(2, cfg['batch_size'])
         self.interm_names = list(prober.interm_names)
         self.preact_of_relu_idx = {
@@ -1156,6 +1168,10 @@ class ClauseVivifier:
             # pins added to GPU probes, GPU probes skipped, CPU seconds.
             'bcp_shortened': 0, 'bcp_removed_lits': 0, 'bcp_pins': 0,
             'bcp_skipped_probes': 0, 'bcp_time': 0.0,
+            # Mirror oracle: clauses shortened by assumption-core solves
+            # (zero GPU), literals removed that way, GPU probes skipped.
+            'mirror_shortened': 0, 'mirror_removed_lits': 0,
+            'mirror_skipped_probes': 0,
         }
 
     # -- clause parsing -------------------------------------------------
@@ -1509,6 +1525,14 @@ class ClauseVivifier:
             return
         self.cur_c = cs[:1].detach().to(self.device)
         self.cur_rhs = rhs[:1].detach()
+        # GPU dry-round gate state is per BaB run (same scoping as the
+        # clause conditioning).
+        gate_key = (cs[0].detach().cpu().numpy().tobytes(),
+                    rhs[0].detach().cpu().numpy().tobytes())
+        if gate_key != self._gpu_run_key:
+            self._gpu_run_key = gate_key
+            self._gpu_dry = 0
+        gpu_off = 0 < self.dry_rounds <= self._gpu_dry
         # BCP pre-pass source: the SAT layer's clause DB, scoped to THIS
         # run (this round's fresh clauses are mirrored only AFTER
         # vivification, so a clause never propagates against itself).
@@ -1524,6 +1548,14 @@ class ClauseVivifier:
                           'pre-pass disabled.')
             else:
                 bcp_run_key = bcp_layer.run_key_of(cs, rhs)
+        mirror = (self.mirror and bcp_layer is not None
+                  and bcp_run_key is not None)
+        if mirror and bcp_run_key == bcp_layer.run_key \
+                and bcp_layer.run_unsat:
+            # This OR group already carries an UNSAT certificate: it is
+            # verified, its domains will be pruned at the next pick_out --
+            # no clause of this run is worth a probe.
+            return
         # Parse + screen CPU-side; collect (cut, ordered lits, prefix js).
         jobs, cand_pins, cand_key = [], [], []
         bcp_min = {}  # job_id -> prefix length proven by BCP conflict alone
@@ -1541,6 +1573,32 @@ class ClauseVivifier:
                 continue
             st['eligible'] += 1
             st['len_hist'][n] = st['len_hist'].get(n, 0) + 1
+            # Mirror oracle pre-pass: one conflict-bounded assumption-core
+            # solve per clause. An UNSAT core is the shortened clause --
+            # full conflict analysis over everything the SAT layer holds,
+            # zero GPU -- strictly stronger than the propagation-only
+            # conflict test of the BCP loop below (which is kept purely
+            # for its implied extra pins).
+            if mirror:
+                status, kept = bcp_layer.vivify_clause_pins(
+                    lits, bcp_run_key)
+                if status == 'unsat_run':
+                    # Per-run UNSAT certificate: the OR group is verified;
+                    # every queued probe of this run is dead weight.
+                    st['mirror_skipped_probes'] += n + len(cand_pins)
+                    print('Phase probing joint vivification: mirror UNSAT '
+                          'certificate for this run -- skipping all '
+                          'remaining vivification probes.')
+                    return
+                if status == 'core' and len(kept) < n:
+                    short = [lits[i] for i in kept]
+                    self._rewrite(cut, short)
+                    st['shortened'] += 1
+                    st['removed_lits'] += n - len(kept)
+                    st['mirror_shortened'] += 1
+                    st['mirror_removed_lits'] += n - len(kept)
+                    st['mirror_skipped_probes'] += n
+                    continue
             job_id = len(jobs)
             jobs.append((cut, lits))
             # BCP pre-pass: propagate each prefix's pin set through the
@@ -1575,6 +1633,9 @@ class ClauseVivifier:
             # this grade can never shorten here). BCP-conflicted prefixes
             # (j >= bcp_stop) are already entailed and are not probed.
             j_max = (bcp_stop - 1) if bcp_stop is not None else n
+            if gpu_off:
+                st['gpu_gated_probes'] = st.get('gpu_gated_probes', 0) + j_max
+                j_max = 0
             for j in range(1, j_max + 1):
                 if len(cand_pins) >= self.budget:
                     break
@@ -1619,6 +1680,17 @@ class ClauseVivifier:
             st['removed_lits'] += len(lits) - j
             st['shortened'] += 1
             self._rewrite(cut, lits[:j])
+        # Dry-round accounting: a round counts as dry when the GPU probes
+        # shortened nothing the zero-GPU passes had not already found.
+        if self.dry_rounds > 0 and not gpu_off and cand_pins:
+            gpu_new = sum(1 for jid, j in min_j.items()
+                          if j < bcp_min.get(jid, len(jobs[jid][1])))
+            self._gpu_dry = 0 if gpu_new else self._gpu_dry + 1
+            if self._gpu_dry == self.dry_rounds:
+                print('Phase probing joint vivification: '
+                      f'{self.dry_rounds} consecutive GPU-dry rounds -- '
+                      'gating GPU probes off for this run (CPU passes '
+                      'continue).')
         bcp_part = ''
         if bcp_layer is not None:
             bcp_part = (f"bcp_shortened={st['bcp_shortened']} "
@@ -1626,6 +1698,20 @@ class ClauseVivifier:
                         f"bcp_pins={st['bcp_pins']}, "
                         f"bcp_skipped_probes={st['bcp_skipped_probes']}, "
                         f"bcp_time={st['bcp_time']:.2f}s, ")
+        if mirror:
+            ms = bcp_layer.stats
+            bcp_part += (
+                f"mirror_shortened={st['mirror_shortened']} "
+                f"(-{st['mirror_removed_lits']} lits, 0 GPU), "
+                f"mirror_skipped_probes={st['mirror_skipped_probes']}, "
+                f"mirror_calls={ms['mirror_calls']} "
+                f"(unsat={ms['mirror_unsat']}, sat={ms['mirror_sat']}, "
+                f"unknown={ms['mirror_unknown']}, "
+                f"time={ms['mirror_time']:.3f}s), "
+                f"flp_units={ms['flp_units']}, ")
+        if st.get('gpu_gated_probes'):
+            bcp_part += (f"gpu_gated_probes={st['gpu_gated_probes']} "
+                         f"(dry={self._gpu_dry}), ")
         pool_part = ''
         if st['cut_pool_rounds']:
             pool_part = (f"probe_cut_pool={st['cut_pool_size']} cuts "

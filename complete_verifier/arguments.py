@@ -506,6 +506,19 @@ class ConfigHandler:
                                'the GPU probe (sound: implied by the prefix pins over entailed clauses). Requires '
                                '--phase_probing_sat_layer.',
                           hierarchy=h + ["vivify_bcp"])
+        self.add_argument("--phase_probing_vivify_dry_rounds", type=int, default=0,
+                          help='Stop issuing GPU vivification probes for the current BaB run after this many '
+                               'consecutive rounds in which the GPU probes shortened nothing beyond the zero-GPU '
+                               'passes (mirror cores / BCP conflicts); the CPU-side duties keep running. 0 = never '
+                               'gate. Takes GPU overhead out of runs whose clause pools have stopped yielding.',
+                          hierarchy=h + ["vivify_dry_rounds"])
+        self.add_argument("--phase_probing_fact_cuts_max", type=int, default=50,
+                          help='Per-run cap on SAT-derived fact cuts (failed-literal units, implication edges) '
+                               'injected into the BICCOS pool. Every installed cut is a general-beta constraint '
+                               'optimized per domain, so hundreds of them accrue real beta-CROWN overhead -- same '
+                               'rationale as bab:cut:number_cuts. Units are emitted before edges (forced phases '
+                               'are the strongest clause cuts). 0 disables fact-cut injection.',
+                          hierarchy=h + ["fact_cuts_max"])
         self.add_argument("--phase_probing_sat_layer", action='store_true',
                           dest='phase_probing_sat_layer',
                           help='CPU-side clause database over ReLU phase literals (PySAT/CaDiCaL) mirroring probe '
@@ -513,6 +526,17 @@ class ConfigHandler:
                                'BaB domain to prune falsified domains before any bound computation and to clamp '
                                'propagation-implied phases. Requires phase probing to be enabled.',
                           hierarchy=h + ["sat_layer"])
+        self.add_argument("--phase_probing_mirror", action='store_true',
+                          dest='phase_probing_mirror',
+                          help='Mirror-oracle duties on the SAT layer (supersedes the vivify_bcp propagation '
+                               'pre-pass with full conflict analysis, same CPU cost class): (1) assumption-core '
+                               'clause vivification -- a conflict-bounded solve of the negated clause whose UNSAT '
+                               'core IS the shortened clause, zero GPU; (2) per-run UNSAT certificate -- an empty '
+                               'core proves the entailed clause set of this OR group boolean-unsat, so the group is '
+                               'verified and all its domains are pruned; (3) failed-literal probing over the clause '
+                               'database (gated on DB growth), yielding run-scoped forced phases. Requires '
+                               '--phase_probing_sat_layer.',
+                          hierarchy=h + ["mirror"])
 
         h = ["solver", "beta-crown"]
         self.add_argument("--lr_alpha", type=float, default=0.01,

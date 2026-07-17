@@ -227,6 +227,20 @@ class BICCOS:
                                 self.tmp_cuts,
                                 pp_sat.run_key_of(d.get('cs'),
                                                   d.get('thresholds')))
+                            # SAT-derived facts (failed-literal units +
+                            # implication edges) join the pool as clause
+                            # cuts: the relaxation of EVERY subsequent
+                            # subproblem gets them via optimized cut
+                            # multipliers, not just the picked domains the
+                            # SAT layer clamps lazily.
+                            fact_cuts = pp_sat.pop_new_cut_facts()
+                            if fact_cuts:
+                                self.tmp_cuts.extend(fact_cuts)
+                                print(f'Phase probing SAT layer: injected '
+                                      f'{len(fact_cuts)} SAT-derived fact '
+                                      'cuts (failed-literal units / '
+                                      'implication edges) into the BICCOS '
+                                      'pool.')
                     # ----------------- phase probing end ------------------
 
                     add_cuts_time = time.time() # record the inference time

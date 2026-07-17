@@ -72,9 +72,23 @@ class PhaseSATLayer:
         self.run_key = None     # fingerprint of the current run's (cs, rhs)
         self._seen = set()      # dedup over run clauses
         self._solver = None
+        self.mirror = arguments.Config['solver']['phase_probing']['mirror']
+        self.fact_cuts_max = arguments.Config['solver']['phase_probing'][
+            'fact_cuts_max']
+        self._fact_cuts_emitted = 0  # per-run count against fact_cuts_max
+        self.run_unsat = False  # per-run UNSAT certificate (mirror duty 2)
+        self._run_unsat_reported = False
+        self._flp_last_clauses = 0   # DB size at the last failed-lit pass
+        self._flp_decided = set()    # literals already known unit this run
+        self._new_unit_lits = []     # flp units not yet exported as cuts
+        self._edges_exported = False  # persistent edges exported this run
         self.stats = {
             'domains_checked': 0, 'domains_pruned': 0, 'phases_clamped': 0,
             'clauses': 0, 'run_flushes': 0, 'time': 0.0,
+            'mirror_calls': 0, 'mirror_unsat': 0, 'mirror_sat': 0,
+            'mirror_unknown': 0, 'mirror_time': 0.0,
+            'flp_solves': 0, 'flp_units': 0, 'flp_time': 0.0,
+            'unsat_runs': 0,
         }
         # Persistent facts. Positive literal = phase ACTIVE (z = 1).
         for (ridx, nidx, sign), targets in (implications_int or {}).items():
@@ -89,6 +103,7 @@ class PhaseSATLayer:
             lit = self._lit_int(ridx, nidx, sign)
             if lit is not None:
                 self.persistent.append([lit])
+        self._persistent_keys = {frozenset(c) for c in self.persistent}
         print(f'Phase probing SAT layer: armed with {len(self.persistent)} '
               'persistent clauses (implication edges + forced phases).')
 
@@ -131,6 +146,13 @@ class PhaseSATLayer:
             self.run_clauses, self._seen = [], set()
             self.run_key = run_key
             self._solver = None
+            self.run_unsat = False
+            self._run_unsat_reported = False
+            self._flp_last_clauses = 0
+            self._flp_decided = set()
+            self._new_unit_lits = []
+            self._edges_exported = False
+            self._fact_cuts_emitted = 0
 
     def add_blocking_cuts(self, cuts, run_key):
         """Mirror BICCOS blocking clauses (possibly vivified) into the RUN
@@ -160,7 +182,7 @@ class PhaseSATLayer:
             if not ok or not clause:
                 continue
             key = frozenset(clause)
-            if key in self._seen:
+            if key in self._seen or key in self._persistent_keys:
                 continue
             self._seen.add(key)
             self.run_clauses.append(sorted(clause))
@@ -169,6 +191,8 @@ class PhaseSATLayer:
             added += 1
         if added:
             self.stats['clauses'] += added
+        if self.mirror and added:
+            self.failed_literal_pass()
 
     # -- pin-set propagation (vivification BCP) ---------------------------
 
@@ -219,6 +243,179 @@ class PhaseSATLayer:
                     out.append((ridx, nidx, 1 if lit > 0 else -1))
         return True, out
 
+    # -- mirror-oracle duties (Marabou port) -------------------------------
+
+    def _mark_run_unsat(self):
+        """The clause DB of this run is boolean-unsat. Every clause is
+        satisfied by the phase assignment of any counterexample of this
+        OR group's specification, so an inconsistent DB proves the group
+        has no counterexample: the OR group is VERIFIED. Delivered by
+        pruning every subsequently picked domain of this run."""
+        if not self.run_unsat:
+            self.run_unsat = True
+            self.stats['unsat_runs'] += 1
+            print('Phase probing SAT layer: mirror UNSAT certificate -- '
+                  'the entailed clause set of this OR group is '
+                  'boolean-unsat; the group is verified, pruning all '
+                  'remaining domains.')
+
+    def vivify_clause_pins(self, pins, run_key, conf_budget=200):
+        """Assumption-core vivification of one blocking clause, given as
+        its pin set [(relu_idx, neuron_idx, sign)] (the NEGATIONS of the
+        clause literals). Conflict-bounded solve of DB + pins:
+
+          UNSAT, empty core  -> ('unsat_run', None): per-run UNSAT
+                                certificate (see _mark_run_unsat);
+          UNSAT, core        -> ('core', kept): kept = indices into pins
+                                whose literals form the failed-assumption
+                                core; the disjunction of the corresponding
+                                clause literals is entailed on its own, so
+                                the clause shortens to them (full conflict
+                                analysis, zero GPU);
+          SAT                -> ('sat', None): no boolean shortening
+                                possible against the current DB;
+          budget exceeded    -> ('unknown', None).
+
+        The clause itself must not be in the DB yet (callers mirror fresh
+        clauses only AFTER their vivification attempt), so it cannot
+        refute itself. Unmappable pins degrade to ('unmapped', None)."""
+        if run_key is None:
+            return 'unmapped', None
+        if run_key != self.run_key:
+            self._flush_run(run_key)
+        if self.run_unsat:
+            return 'unsat_run', None
+        lits = []
+        for (ridx, nidx, sign) in pins:
+            lit = self._lit_int(ridx, nidx, sign)
+            if lit is None:
+                return 'unmapped', None
+            lits.append(lit)
+        t0 = time.time()
+        solver = self._get_solver()
+        solver.conf_budget(conf_budget)
+        res = solver.solve_limited(assumptions=lits)
+        self.stats['mirror_calls'] += 1
+        self.stats['mirror_time'] += time.time() - t0
+        if res is None:
+            self.stats['mirror_unknown'] += 1
+            return 'unknown', None
+        if res:
+            self.stats['mirror_sat'] += 1
+            return 'sat', None
+        self.stats['mirror_unsat'] += 1
+        core = solver.get_core()
+        if not core:
+            self._mark_run_unsat()
+            return 'unsat_run', None
+        coreset = set(core)
+        kept = [i for i, lit in enumerate(lits) if lit in coreset]
+        if not kept:
+            # Defensive: a nonempty core disjoint from the assumptions
+            # should be impossible (cores are assumption subsets).
+            self._mark_run_unsat()
+            return 'unsat_run', None
+        return 'core', kept
+
+    def failed_literal_pass(self, max_time=1.0, growth_gate=32):
+        """Boolean failed-literal probing over the clause DB: for every
+        undecided phase variable, propagate each sign; a conflict makes
+        the negation a run-scoped unit (a forced phase valid for this OR
+        group), and both signs conflicting is a per-run UNSAT
+        certificate. Pure propagation, microseconds per literal. Re-runs
+        only when the DB has grown since the last pass (Marabou's gate)."""
+        if self.run_unsat:
+            return
+        db_size = len(self.persistent) + len(self.run_clauses)
+        if db_size < self._flp_last_clauses + growth_gate:
+            return
+        self._flp_last_clauses = db_size
+        t0 = time.time()
+        solver = self._get_solver()
+        new_units = 0
+        for v in list(self._var_of.values()):
+            if v in self._flp_decided or -v in self._flp_decided:
+                continue
+            failed = []
+            for lit in (v, -v):
+                ok, _ = solver.propagate(assumptions=[lit])
+                self.stats['flp_solves'] += 1
+                if not ok:
+                    failed.append(lit)
+            if len(failed) == 2:
+                self._mark_run_unsat()
+                break
+            if failed:
+                unit = -failed[0]
+                self._flp_decided.add(unit)
+                self._seen.add(frozenset([unit]))
+                self.run_clauses.append([unit])
+                solver.add_clause([unit])
+                self._new_unit_lits.append(unit)
+                new_units += 1
+                self.stats['flp_units'] += 1
+            if time.time() - t0 > max_time:
+                break
+        self.stats['flp_time'] += time.time() - t0
+        if new_units:
+            print(f'Phase probing SAT layer: failed-literal probing found '
+                  f'{new_units} run-scoped forced phases '
+                  f"(cumulative: units={self.stats['flp_units']}, "
+                  f"solves={self.stats['flp_solves']}, "
+                  f"time={self.stats['flp_time']:.3f}s).")
+
+    def pop_new_cut_facts(self):
+        """SAT-derived facts as GCP-CROWN blocking-clause cuts for the
+        current run's BICCOS pool, so every subproblem's relaxation gets
+        them with optimized multipliers (instead of only lazily clamping
+        picked domains): failed-literal units (run-scoped forced phases,
+        1-literal cuts) and -- once per run -- the persistent implication
+        edges (box-sound 2-literal clause cuts). Wire form of a clause
+        OR_i phase(p_i): coefficient s_i = -p_i, sum s_i z_i <= npos - 1
+        (the add_blocking_cuts mapping, inverted)."""
+        if not self.mirror or self.fact_cuts_max <= 0:
+            return []
+        # Safety valve: every installed cut is a per-domain-optimized
+        # general-beta constraint, so fact cuts respect a number_cuts-style
+        # per-run budget. Units go first (a forced phase is the strongest
+        # clause cut); edges fill whatever budget remains.
+        budget = self.fact_cuts_max - self._fact_cuts_emitted
+        if budget <= 0:
+            return []
+        lits_lists = [[l] for l in self._new_unit_lits[:budget]]
+        self._new_unit_lits = self._new_unit_lits[len(lits_lists):]
+        if not self._edges_exported and len(lits_lists) < budget:
+            self._edges_exported = True
+            edges = [c for c in self.persistent if len(c) == 2]
+            lits_lists += edges[:budget - len(lits_lists)]
+        if not lits_lists:
+            return []
+        self._fact_cuts_emitted += len(lits_lists)
+        name_of_var = {v: k for k, v in self._var_of.items()}
+        ridx_of_name = {v: k for k, v in self.preact_of_relu_idx.items()}
+        out = []
+        for lits in lits_lists:
+            decision, coeffs, ok = [], [], True
+            for lit in lits:
+                name, nidx = name_of_var[abs(lit)]
+                ridx = ridx_of_name.get(name)
+                if ridx is None:
+                    ok = False
+                    break
+                decision.append([ridx, int(nidx)])
+                coeffs.append(-1.0 if lit > 0 else 1.0)
+            if not ok:
+                continue
+            npos = sum(1 for c in coeffs if c > 0)
+            out.append({
+                'x_decision': [], 'x_coeffs': [],
+                'relu_decision': [], 'relu_coeffs': [],
+                'arelu_decision': decision, 'arelu_coeffs': coeffs,
+                'pre_decision': [], 'pre_coeffs': [],
+                'bias': float(npos - 1), 'c': -1,
+            })
+        return out
+
     # -- domain filtering -------------------------------------------------
 
     def _get_solver(self):
@@ -260,6 +457,18 @@ class PhaseSATLayer:
             # The batch belongs to a different BaB run than the stored run
             # clauses: flush them (persistent facts remain valid).
             self._flush_run(run_key)
+        if self.run_unsat and run_key is not None:
+            # Mirror UNSAT certificate for this run: every domain of the
+            # OR group is counterexample-free (see _mark_run_unsat).
+            n = len(histories)
+            self.stats['domains_checked'] += n
+            self.stats['domains_pruned'] += n
+            self.stats['time'] += time.time() - t0
+            if not self._run_unsat_reported:
+                self._run_unsat_reported = True
+                print(f'Phase probing SAT layer: UNSAT certificate prunes '
+                      f'all {n} picked domains of this run.')
+            return [], n
         solver = self._get_solver()
         lb_dict = d.get('lower_bounds')
         ub_dict = d.get('upper_bounds')
