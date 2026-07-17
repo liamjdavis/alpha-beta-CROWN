@@ -481,6 +481,21 @@ class PhaseSATLayer:
             if lits is None:
                 keep.append(i)
                 continue
+            if not lits:
+                # No phase splits on this domain's path (the root domain, and
+                # every domain until the first split). The empty assumption set
+                # is trivially satisfiable, so there is nothing to refute --
+                # but PySAT's propagate() reports ok=False for empty assumptions
+                # on a clause-free solver:
+                #     Cadical195().propagate(assumptions=[])  -> (False, [])
+                #     Cadical195().propagate(assumptions=[1]) -> (True, [1])
+                # Reading that as "refuted" prunes the root, empties the picked
+                # batch, and leaves multi-tree BaB with no tree to restore
+                # (assert best_node is not None, branching_domains.py). Only
+                # bites when probing armed the DB with no facts, which is the
+                # common case on instances with no edges/forced phases.
+                keep.append(i)
+                continue
             ok, implied = solver.propagate(assumptions=lits)
             if not ok:
                 pruned += 1
