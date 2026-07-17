@@ -221,6 +221,14 @@ class PhaseSATLayer:
             if lit is None:
                 return True, []
             lits.append(lit)
+        if not lits:
+            # Same PySAT quirk process_picked_domains guards against:
+            # propagate(assumptions=[]) reports ok=False on a clause-free
+            # solver, and ok=False here claims the pinned region is
+            # counterexample-free -- for an empty pin set that region is the
+            # whole box. The live caller (vivification prefixes, j >= 1)
+            # never passes empty pins; this guards the next caller that does.
+            return True, []
         ok, implied = self._get_solver().propagate(assumptions=lits)
         if not ok:
             return False, []
