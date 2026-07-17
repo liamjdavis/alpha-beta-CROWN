@@ -170,6 +170,55 @@ class PhaseSATLayer:
         if added:
             self.stats['clauses'] += added
 
+    # -- pin-set propagation (vivification BCP) ---------------------------
+
+    def propagate_pins(self, pins, run_key):
+        """Unit-propagate a vivification pin set [(relu_idx, neuron_idx,
+        sign)] over the clause database scoped to run_key (persistent
+        clauses + run clauses of THAT run; a mismatched stored run is
+        flushed first, exactly like process_picked_domains).
+
+        Returns (ok, implied):
+          ok=False   -- the pins conflict with entailed clauses: the pinned
+                        region contains no counterexample of this run's
+                        specification (same argument as duty (a)).
+          ok=True    -- implied is the list of propagation-implied phase
+                        literals as (relu_idx, neuron_idx, sign) tuples,
+                        excluding the pins themselves; each holds for every
+                        counterexample inside the pinned region.
+        Unmappable pins degrade gracefully to (True, [])."""
+        if run_key is None:
+            return True, []
+        if run_key != self.run_key:
+            self._flush_run(run_key)
+        lits = []
+        for (ridx, nidx, sign) in pins:
+            lit = self._lit_int(ridx, nidx, sign)
+            if lit is None:
+                return True, []
+            lits.append(lit)
+        ok, implied = self._get_solver().propagate(assumptions=lits)
+        if not ok:
+            return False, []
+        out = []
+        if implied:
+            assumed = set(lits)
+            if getattr(self, '_name_of_var', None) is None \
+                    or len(self._name_of_var) != len(self._var_of):
+                self._name_of_var = {
+                    v: k for k, v in self._var_of.items()}
+            if getattr(self, '_ridx_of_name', None) is None:
+                self._ridx_of_name = {
+                    v: k for k, v in self.preact_of_relu_idx.items()}
+            for lit in implied:
+                if lit in assumed:
+                    continue
+                name, nidx = self._name_of_var[abs(lit)]
+                ridx = self._ridx_of_name.get(name)
+                if ridx is not None:
+                    out.append((ridx, nidx, 1 if lit > 0 else -1))
+        return True, out
+
     # -- domain filtering -------------------------------------------------
 
     def _get_solver(self):

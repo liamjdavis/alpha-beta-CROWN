@@ -206,7 +206,13 @@ class BICCOS:
                     # literals the cheap pass could not remove.
                     pp_vivifier = getattr(net, 'phase_probing_vivifier', None)
                     if pp_vivifier is not None and self.tmp_cuts:
-                        pp_vivifier.vivify(self.tmp_cuts, d)
+                        # pool_cuts feed the oracle's probe-scoped cut
+                        # module in vivify_use_cuts='pool' mode: the pool
+                        # as of the previous rounds (with earlier
+                        # vivifications already merged in) + cplex cuts.
+                        pp_vivifier.vivify(
+                            self.tmp_cuts, d,
+                            pool_cuts=self.biccos_cuts + self.cplex_cuts)
                     # Mirror the (possibly vivified) fresh blocking clauses
                     # into the CPU SAT layer (see sat_layer.py). Clause
                     # literal ints must be relu-layer indices, so this is

@@ -487,6 +487,25 @@ class ConfigHandler:
                           help='Optimizer iterations per beta-grade vivification probe chunk (joint alpha/beta/'
                                'cut-beta optimization on the pinned domains). 0 = inherit solver:beta-crown:iteration.',
                           hierarchy=h + ["vivify_iterations"])
+        self.add_argument("--phase_probing_vivify_use_cuts", type=str, default="auto",
+                          choices=["auto", "off", "pool"],
+                          help='GCP-CROWN cut usage inside the joint-pin vivification oracle (beta grade only): '
+                               '"auto" uses whatever cut module the net currently holds (the pool as of the previous '
+                               'BICCOS rebuild; round 1 runs cut-less), "off" disables cut terms in the probes '
+                               '(ablation arm), "pool" rebuilds a probe-scoped cut module from the CURRENT pool -- '
+                               'BICCOS clauses (including previously vivified ones), cplex cuts, pending phase-probing '
+                               'implied-bound cuts and this round\'s freshly inferred clauses -- making the clause '
+                               'pool self-strengthening. Cut multipliers are re-optimized on the pinned domains by '
+                               'the vivify_iterations loop.',
+                          hierarchy=h + ["vivify_use_cuts"])
+        self.add_argument("--phase_probing_vivify_bcp", action='store_true',
+                          dest='phase_probing_vivify_bcp',
+                          help='Unit-propagate every (clause, prefix) pin set through the SAT layer\'s clause database '
+                               'before spending GPU on it: a propagation conflict shortens the clause with zero GPU '
+                               'cost, and otherwise the propagation-implied phase literals are added as extra pins to '
+                               'the GPU probe (sound: implied by the prefix pins over entailed clauses). Requires '
+                               '--phase_probing_sat_layer.',
+                          hierarchy=h + ["vivify_bcp"])
         self.add_argument("--phase_probing_sat_layer", action='store_true',
                           dest='phase_probing_sat_layer',
                           help='CPU-side clause database over ReLU phase literals (PySAT/CaDiCaL) mirroring probe '

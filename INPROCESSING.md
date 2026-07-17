@@ -127,14 +127,20 @@ preserved.)
 --number_cuts 200` per the BICCOS class docstring; the canonical arms
 are default-settings-only by user decision, 2026-07-15.)
 
-Inertness re-verified 2026-07-15 after the vivification/SAT edits: the
-plain control command (no probing flags, no cuts) gives safe 26.2s on
-idx0 with zero phase-probing/SAT/vivification output — matching the
-pre-edit baseline (safe 26–29s).
+Inertness re-verified 2026-07-15 after the vivification/SAT edits and
+again 2026-07-16 after the vivify_use_cuts/vivify_bcp edits: the plain
+control command (no probing flags, no cuts) gives safe 25–26s on idx0
+with zero phase-probing/SAT/vivification output — matching the pre-edit
+baseline (safe 26–29s).
+
+Strongest measured treated variant (see the closed-loop and BCP sections
+below): add `--phase_probing_vivify_use_cuts pool
+--phase_probing_vivify_bcp` to the treated arm.
 
 Ablations: drop `--phase_probing_sat_layer` for vivification-only; drop
 `--phase_probing_vivify_joint` for SAT-layer-only (the SAT DB then holds
-edges/forced phases + unvivified BICCOS clauses). Read the
+edges/forced phases + unvivified BICCOS clauses);
+`--phase_probing_vivify_use_cuts off` for a cut-less oracle. Read the
 `Phase probing joint vivification:` lines (cumulative eligible /
 shortened / literals_removed / full-pin verified / probes / gpu_time /
 len_hist) and the `Phase probing SAT layer:` lines (checked / pruned /
@@ -174,6 +180,8 @@ yaml block `solver: phase_probing:` (CLI in parentheses):
 | `vivify_max_lits` (`--phase_probing_vivify_max_lits`) | 32 | max clause length considered by joint vivification |
 | `vivify_budget` (`--phase_probing_vivify_budget`) | 8192 | total vivification probes per instance |
 | `vivify_iterations` (`--phase_probing_vivify_iterations`) | 0 = inherit beta-crown iteration | optimizer iterations per beta-grade probe chunk (recommended: 20) |
+| `vivify_use_cuts` (`--phase_probing_vivify_use_cuts`) | auto | GCP-CROWN cuts in the vivification oracle: auto (net's current module = previous rebuild's pool; round 1 cut-less) / off (ablation) / pool (probe-scoped module rebuilt per round from pool + pending + fresh clauses — the closed loop) |
+| `vivify_bcp` (`--phase_probing_vivify_bcp`) | false | unit-propagate each (clause, prefix) pin set through the SAT layer before GPU: conflicts shorten at zero GPU cost, implied literals become extra pins (needs `sat_layer`) |
 | `sat_layer` (`--phase_probing_sat_layer`) | false | CPU clause DB (PySAT/CaDiCaL): pick_out-time domain filtering + phase clamping |
 
 Env (measurement only): `PHASE_PROBING_GUROBI_MAX=N` caps gurobi-rung
@@ -301,6 +309,114 @@ shorten. Shortened clauses flow into the GCP-CROWN pool automatically
 (vivification edits `tmp_cuts` in place BEFORE pool insertion/merging) —
 no separate pending-cut path needed.
 
+### Closing the pool–oracle loop: `vivify_use_cuts` (2026-07-16)
+
+The beta-grade oracle has ALWAYS engaged GCP-CROWN cuts when a cut module
+existed (`set_cut_params` flips per-activation `cut_used`, and
+`set_beta_cuts` registers the general betas with the optimizer, so the
+cut multipliers are re-optimized on the pinned domains by the
+`vivify_iterations` loop — no extra machinery was needed for that). What
+`auto` (the old, still-default behavior) misses: the module is the pool
+as of the PREVIOUS BICCOS rebuild, so round-1 probes run entirely
+cut-less (the module does not exist yet), pending phase-probing
+implied-bound cuts are invisible until their official install, and this
+round's freshly inferred clauses never reach the probe pool.
+
+`vivify_use_cuts: pool` closes the loop: each vivify call builds a
+probe-scoped cut module from `biccos_cuts` (previous rounds, with
+earlier vivifications already merged in — a clause shortened in round k
+strengthens the oracle testing every clause of round k+1) + cplex cuts +
+pending implied-bound cuts + this round's fresh clauses, deduped, and
+swaps it in for the probes only (cutter/module state is fully restored
+so BICCOS's own rebuild logic sees the exact pre-vivify state).
+`off` disables cut terms in the probes (the ablation arm).
+
+Soundness: every pool entry is entailed on the counterexample-relevant
+region of THIS run's spec — the same conditioning the probes use. A
+fresh clause participating in its own j < n probes is standard
+SAT-vivification semantics (every counterexample in the pinned region
+satisfies the entailed clause); it cannot fake a shortening
+propositionally because root-false literals are screened by `_parse`.
+The j = n full-pin probe of a pool-member clause IS self-certifying in
+principle (the full pin contradicts the clause itself), so in pool mode
+the full-pin stat measures the optimizer's cut exploitation rather than
+pure grade adequacy — measured, it stays far from 100% (see below), i.e.
+20 iterations do not fully exploit even the self-cut.
+
+Measured (single trajectories, canonical arm + the flag; verdict parity
+in all arms — idx0 safe everywhere, idx7 is the timeout instance in
+control too). Arms are not iso-pool (oracle GPU time competes with BaB
+inside the timeout): compare rates.
+
+cifar100 idx0 (2–3-lit clause pool):
+
+| use_cuts | eligible | shortened | lits | full-pin | probes / GPU s | verdict |
+|---|---|---|---|---|---|---|
+| off | 687 | 0 (0%) | 0 | 105/687 (15.3%) | 1385 / 12.5 | safe 71.5s |
+| auto | 687 | 74 (10.8%) | 74 | 483/687 (70.3%) | 1385 / 13.5 | safe 68.7s |
+| pool | 697 | **119 (17.1%)** | 119 | 458/697 (65.7%) | 1409 / 15.7 | safe 68.8s |
+
+cifar100 idx7 (long clauses, 2–11 lits):
+
+| use_cuts | eligible | shortened | lits | full-pin | probes / GPU s | verdict |
+|---|---|---|---|---|---|---|
+| off | 853 | 132 (15.5%) | 156 | 187/853 (21.9%) | 3680 / 20.1 | unknown 103.3s |
+| auto | 953 | 136 (14.3%) | 160 | 259/953 (27.2%) | 4382 / 30.1 | unknown 101.2s |
+| pool | 950 | **210 (22.1%)** | **235** | 344/950 (36.2%) | 4419 / 32.9 | unknown 110.3s |
+
+Notable: on idx0 the cut pool is the ENTIRE source of shortening — with
+cuts off the oracle shortens nothing (0/687) and full-pin adequacy
+collapses to 15%. On idx7 the oracle retains most of its power without
+cuts (15.5% vs 14.3% shortened rate) but the pool mode's fresh-pool
+rebuild still buys +54% clauses / +47% literals over auto. Pool
+construction cost is negligible (pool sizes 30–242 cuts, 16–20 rebuild
+rounds, GPU delta within jitter).
+
+### BCP-extended pin sets: `vivify_bcp` (2026-07-16)
+
+Before spending GPU on a (clause, prefix) candidate, the prefix's pin
+set is unit-propagated through the SAT layer's clause DB
+(`PhaseSATLayer.propagate_pins`, persistent facts + run clauses scoped
+to THIS run's fingerprint; this round's fresh clauses are mirrored into
+the DB only AFTER vivification, so a clause never propagates against
+itself). Propagation is per-prefix with exactly the prefix pins as
+assumptions, so every implied literal's antecedents lie within the
+prefix — the incremental-assumption scheme that makes prefix semantics
+sound. Two uses:
+
+1. a conflict at prefix j proves the pinned region empty of
+   counterexamples by propagation alone — the clause shortens to j
+   literals at ZERO GPU cost, and all probes with j' >= j are skipped
+   (already entailed);
+2. otherwise the implied literals join the prefix's pin set as extra
+   clamps + SparseBeta splits, making the GPU probe strictly stronger.
+
+Measured (same protocol; `bcp` = canonical arm + `--phase_probing_vivify_bcp`,
+`pool+bcp` = both new flags):
+
+| instance / arm | eligible | shortened | lits | of which BCP-only (0 GPU) | bcp extra pins | probes skipped | full-pin | probes / GPU s | bcp CPU | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| idx0 bcp | 687 | 74 (10.8%) | 74 | 0 | 6106 | 3 | 512/684 (74.9%) | 1382 / 12.7 | 0.01s | safe 64.6s |
+| idx0 pool+bcp | 693 | 115 (16.6%) | 116 | 0 | 6696 | 1 | **591/692 (85.4%)** | 1396 / 12.6 | 0.01s | safe 62.0s |
+| idx7 bcp | 957 | 151 (15.8%) | 179 | **149 (-177 lits)** | 8139 | 431 | 106/703 (15.1%) | 4007 / 30.1 | 0.04s | unknown 105.6s |
+| idx7 pool+bcp | 954 | **223 (23.4%)** | **252** | 148 (-176 lits) | 8121 | 428 | 196/702 (27.9%) | 3977 / 30.8 | 0.04s | unknown 105.9s |
+
+Notable: on idx7 BCP alone finds essentially all of the auto arm's
+shortenings for free (149 zero-GPU vs auto's 136 GPU-probed) — the run
+clause DB accumulated in earlier rounds subsumes much of what the GPU
+oracle re-proves — while the extra implied pins lift what the GPU adds
+on top. On idx0 (2-lit pool, sparse clause interactions) BCP never
+conflicts (0 zero-GPU shortenings) but its ~4.4 extra pins/probe raise
+full-pin adequacy 70.3% → 74.9% (85.4% with pool). CAVEAT: in bcp arms
+the full-pin stat is NOT comparable to non-bcp arms — clauses whose full
+pin conflicts under BCP skip their j = n probe (full_tested drops, and
+the skipped ones are the "easy" clauses).
+
+Combined `pool` + `bcp` is the strongest configuration measured on both
+instances, at unchanged verdicts and ~equal GPU. Suggested cluster arm:
+canonical treated command + `--phase_probing_vivify_use_cuts pool
+--phase_probing_vivify_bcp`.
+
 Per-instance hit rates, cifar100 vnncomp24, full stack (probing + joint
 vivify beta + SAT layer), one trajectory each:
 
@@ -397,12 +513,16 @@ Vivification on this trajectory: 70/687 shortened, full-pin 192/687.
 
 1. Cluster A/B of the vivification + SAT-layer arms (commands above) —
    the per-instance numbers in this doc are single-trajectory pilots;
-   verdict/stat comparison over the full benchmark is pending.
+   verdict/stat comparison over the full benchmark is pending. Include a
+   `--phase_probing_vivify_use_cuts pool --phase_probing_vivify_bcp` arm
+   (strongest measured single-instance configuration).
 2. Vivification oracle strength: 60–75% of full pins do NOT re-verify at
    the beta grade on most instances — the remaining gap to
    `biccos_verification` is per-parent-domain alphas (probes use a
    batch-1 slice of the current net alphas). Plumbing the source domain's
    alphas per clause through `constraint_strengthening` is the next rung.
+   (The 2026-07-16 closed-loop/BCP work narrows this differently: pool
+   cuts + implied pins lift idx0 full-pin adequacy to 85%.)
 3. Longer-clause benchmarks: idx7-like instances (clauses 4–6+ literals)
    are where multi-literal descent pays; the 2-literal pools of idx0/3/4
    cap the hit rate at "2→1 = forced phase" conversions.
@@ -414,3 +534,63 @@ Vivification on this trajectory: 70/687 shortened, full-pin 192/687.
 6. Per-probe alpha re-optimization rung, if hull gains justify the compute.
 7. Forced-phase hunting on small-deficit instances (where `mip_confirm`
    would finally have a behavioral test case).
+
+## Plan: the mirror-oracle port (from Marabou, 2026-07-16)
+
+Marabou consolidated its entire boolean side into ONE extra CaDiCaL (the
+"mirror") holding only query-entailed clauses, with five duties. The SAT
+layer here (`sat_layer.py`, PySAT/CaDiCaL) is already that instance — this
+plan upgrades its duties to match, replacing bespoke logic and GPU calls
+with microsecond SAT queries. The overhead argument cuts our way twice:
+every duty moved into the solver is (a) code we no longer hand-prove and
+(b) work moved OFF the GPU (the BCP pre-pass already shortens 149 idx7
+clauses at literally zero GPU cost — this generalizes).
+
+1. **UNSAT-proof duty (new, highest value).** Marabou's key discovery: when
+   a DB of entailed clauses goes UNSAT below its assumptions, the query
+   itself is refuted — an early-termination certificate. Here, clauses are
+   entailed PER OR-GROUP, so the certificate is per-run: if the SAT layer's
+   per-run DB (BICCOS + vivified + forced phases under the run's
+   `cs`/`thresholds` fingerprint) is UNSAT, that OR group is VERIFIED —
+   skip its remaining BaB entirely. Detection is free: PySAT
+   `solve(assumptions=[])` (or an empty `propagate` conflict) after each
+   clause batch lands. Soundness mirrors Marabou's: a satisfiable spec
+   region keeps its entailed clause set consistent, so no false verdicts;
+   contradictory entailed facts are exactly what a verified region
+   produces. (Marabou measured proofs firing on the oracle's FIRST solve.)
+2. **Failed-literal probing (boolean, not GPU).** For each undecided phase
+   literal: `propagate([lit])`; conflict ⇒ forced phase for this run, at
+   CPU propagation cost — a third source of forced phases after spec
+   probing and vivification, and it sees everything BICCOS has learned,
+   which GPU-side probing never does.
+3. **Assumption-core vivification upgrade.** The current BCP pre-pass
+   detects conflicts by propagation only; upgrade near-miss clauses to a
+   conflict-bounded `solve(assumptions=neg(clause))` and take the
+   UNSAT-core (`get_core`) as the shortened clause — full conflict
+   analysis, still zero GPU. Marabou's ordering rule applies: a clause
+   enters the SAT DB only AFTER its own vivification attempt
+   (self-refutation guard); PySAT/CaDiCaL cannot delete clauses, so
+   per-run conditionality must ride the run-fingerprint DB flush (already
+   built) and assumptions, never permanent adds.
+4. **Cadence advantage — exploit it.** Marabou's oracle is throttled by
+   CDCL restart cadence (first luby restart lands at ~95% of the search on
+   the calibration anchors). BaB has no such wall: every `update_cut` /
+   BICCOS round is an amortized point, typically dozens per instance. Run
+   duties 1–3 at every round; the same machinery Marabou could only invoke
+   2–3 times per run fires continuously here. This is the structural
+   reason to expect the port to OUTPERFORM the original.
+5. **Learner harvest (optional, needs API check).** Marabou streams the
+   oracle's own learned units/binaries back as entailed facts via
+   `connect_learner`. PySAT does not expose CaDiCaL's Learner interface;
+   approximate with periodic `propagate`-closure sweeps over undecided
+   literals (equivalent information at slightly higher cost), or bind the
+   C++ interface later if measurements justify it.
+
+Transferable laws (measured in Marabou, assume they hold here):
+- Clauses are portable; numeric propagation results are not — re-derive
+  bounds, transfer clauses.
+- Boolean guidance ≠ box knowledge even when logically equivalent —
+  delivery representation changes search trajectories.
+- The oracle doubles as a runtime soundness audit: any unsound clause in
+  any channel surfaces as a premature boolean conflict long before it
+  corrupts a verdict.

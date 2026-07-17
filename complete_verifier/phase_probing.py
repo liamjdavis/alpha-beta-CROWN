@@ -80,6 +80,7 @@ different one-neuron clamp in its interm_bounds tensors -- the exact
 mechanism BaB uses for splitting. compute_bounds runs once per chunk.
 """
 
+import json
 import os
 import time
 
@@ -1114,6 +1115,15 @@ class ClauseVivifier:
                            if cfg['vivify_iterations'] > 0 else
                            arguments.Config['solver']['beta-crown']
                            ['iteration'])
+        # Cut usage of the beta-grade oracle: 'auto' = the net's current
+        # cut module (the pool as of the previous BICCOS rebuild; round 1
+        # runs cut-less), 'off' = no cut terms (ablation), 'pool' = a
+        # probe-scoped module rebuilt per vivify call from the CURRENT
+        # pool + this round's fresh clauses (closed loop; see
+        # _install_probe_cut_pool).
+        self.use_cuts_mode = cfg['vivify_use_cuts']
+        # BCP pre-pass over the SAT layer's clause DB (see vivify()).
+        self.bcp = cfg['vivify_bcp']
         self.batch_size = max(2, cfg['batch_size'])
         self.interm_names = list(prober.interm_names)
         self.preact_of_relu_idx = {
@@ -1139,6 +1149,13 @@ class ClauseVivifier:
             'removed_root': 0, 'probes': 0, 'full_verified': 0,
             'full_tested': 0, 'gpu_time': 0.0, 'skipped_multi_c': 0,
             'len_hist': {},  # eligible clause length -> count
+            # Probe-scoped cut pool ('pool' mode): last pool size + rounds.
+            'cut_pool_size': 0, 'cut_pool_rounds': 0,
+            # BCP pre-pass: clauses shortened by propagation conflict alone
+            # (zero GPU), literals those conflicts removed, extra implied
+            # pins added to GPU probes, GPU probes skipped, CPU seconds.
+            'bcp_shortened': 0, 'bcp_removed_lits': 0, 'bcp_pins': 0,
+            'bcp_skipped_probes': 0, 'bcp_time': 0.0,
         }
 
     # -- clause parsing -------------------------------------------------
@@ -1305,8 +1322,11 @@ class ClauseVivifier:
         # entailed on the counterexample-relevant region of THIS spec, so
         # they may strengthen the probe. Fresh zero-init general betas per
         # chunk; BaB re-installs its own via set_cut_params next round
-        # (the same overwrite biccos_verification already does).
-        use_cuts = (getattr(self.net, 'cut_module', None) is not None
+        # (the same overwrite biccos_verification already does). In 'pool'
+        # mode the module seen here is the probe-scoped one installed by
+        # _install_probe_cut_pool; 'off' disables cut terms entirely.
+        use_cuts = (self.use_cuts_mode != 'off'
+                    and getattr(self.net, 'cut_module', None) is not None
                     and arguments.Config['bab']['cut']['bab_cut'])
         if use_cuts:
             self.net.cut_used = True
@@ -1398,9 +1418,78 @@ class ClauseVivifier:
                     m.cut_used = prev_cut_act[m.name]
         return undo
 
+    def _install_probe_cut_pool(self, fresh_cuts, pool_cuts):
+        """'pool' mode: build a probe-scoped GCP-CROWN cut module over the
+        FULL current pool -- BICCOS clauses of previous rounds (already in
+        their vivified/merged form), cplex cuts, phase probing's pending
+        implied-bound cuts (box-sound, installable before their official
+        install) and this round's freshly inferred clauses. All of these
+        are entailed on the counterexample-relevant region of THIS run's
+        spec (the same conditioning the probes and the clauses share), so
+        the oracle may use them: clause A strengthens the probe testing
+        clause B, closing the loop between pool and oracle.
+
+        Including the fresh clauses means a clause participates in its own
+        probes; for prefixes j < n that is standard SAT-vivification
+        semantics and sound (every counterexample in the pinned region
+        satisfies the entailed clause), and it cannot fake a shortening
+        propositionally because root-false literals were screened by
+        _parse. The j = n diagnostic however becomes self-certifying: the
+        full pin set contradicts the clause itself, so full-pin
+        'verified' then measures the optimizer's cut exploitation, not
+        oracle grade adequacy.
+
+        The swap is fully undone afterwards: BICCOS's own rebuild logic at
+        the end of update_cut must see the exact pre-vivify cutter/module
+        state (including rounds where it decides NOT to rebuild).
+        Returns an undo closure, or None when there is nothing to install.
+        """
+        cutter = getattr(self.model, 'cutter', None)
+        if cutter is None:
+            return None
+        pending = list(getattr(
+            self.model, 'phase_probing_pending_cuts', None) or [])
+        seen, pool = set(), []
+        for cut in list(pool_cuts or []) + pending + list(fresh_cuts or []):
+            key = json.dumps(cut, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                pool.append(cut)
+        if not pool:
+            return None
+        saved_cuts = cutter.cuts
+        saved_cutter_module = cutter.cut_module
+        saved_net_module = getattr(self.net, 'cut_module', None)
+        saved_act_modules = {
+            m.name: getattr(m, 'cut_module', None) for m in self.net.relus}
+        cutter.cuts = pool
+        # construct_cut_module also resets per-relu transient attrs
+        # (masked_beta, *_beta_used, *_coeffs) -- all per-bound-call state
+        # that the next beta attach / official rebuild re-establishes --
+        # and flips cut_used flags, which _swap_net_state's undo restores.
+        try:
+            probe_module = cutter.construct_cut_module()
+        except Exception:
+            cutter.cuts = saved_cuts
+            cutter.cut_module = saved_cutter_module
+            raise
+        self.net.cut_module = probe_module
+        for m in self.net.relus:
+            m.cut_module = probe_module
+        self.stats['cut_pool_size'] = len(pool)
+        self.stats['cut_pool_rounds'] += 1
+
+        def undo():
+            cutter.cuts = saved_cuts
+            cutter.cut_module = saved_cutter_module
+            self.net.cut_module = saved_net_module
+            for m in self.net.relus:
+                m.cut_module = saved_act_modules.get(m.name)
+        return undo
+
     # -- entry point -----------------------------------------------------
 
-    def vivify(self, cuts, d):
+    def vivify(self, cuts, d, pool_cuts=None):
         """Joint-pin descent over freshly inferred blocking clauses.
         `cuts` is modified in place; `d` is the picked-domain batch dict
         whose cs/thresholds define THIS BaB run's clause (the conditioning
@@ -1420,8 +1509,24 @@ class ClauseVivifier:
             return
         self.cur_c = cs[:1].detach().to(self.device)
         self.cur_rhs = rhs[:1].detach()
+        # BCP pre-pass source: the SAT layer's clause DB, scoped to THIS
+        # run (this round's fresh clauses are mirrored only AFTER
+        # vivification, so a clause never propagates against itself).
+        bcp_layer, bcp_run_key = None, None
+        if self.bcp:
+            bcp_layer = getattr(self.model, 'phase_probing_sat_layer', None)
+            if bcp_layer is None:
+                if not getattr(self, '_bcp_warned', False):
+                    self._bcp_warned = True
+                    print('Phase probing joint vivification: vivify_bcp '
+                          'requested but the SAT layer is not armed '
+                          '(enable --phase_probing_sat_layer); BCP '
+                          'pre-pass disabled.')
+            else:
+                bcp_run_key = bcp_layer.run_key_of(cs, rhs)
         # Parse + screen CPU-side; collect (cut, ordered lits, prefix js).
         jobs, cand_pins, cand_key = [], [], []
+        bcp_min = {}  # job_id -> prefix length proven by BCP conflict alone
         for cut in cuts:
             lits, removed_root = self._parse(cut)
             if lits is None:
@@ -1438,30 +1543,70 @@ class ClauseVivifier:
             st['len_hist'][n] = st['len_hist'].get(n, 0) + 1
             job_id = len(jobs)
             jobs.append((cut, lits))
+            # BCP pre-pass: propagate each prefix's pin set through the
+            # clause DB, incrementally (assumption ordering = prefix
+            # ordering, so every implied literal's antecedents lie within
+            # the prefix). A conflict at prefix j proves the pinned region
+            # empty of counterexamples by propagation alone -- the clause
+            # shortens to j literals with ZERO GPU cost, and probes for
+            # j' >= j are pointless (already entailed). Without a
+            # conflict, the implied literals join the prefix's pin set,
+            # making the GPU probe strictly stronger.
+            bcp_stop, extras = None, {}
+            if bcp_layer is not None and bcp_run_key is not None:
+                tb = time.time()
+                for j in range(1, n + 1):
+                    ok, implied = bcp_layer.propagate_pins(
+                        lits[:j], bcp_run_key)
+                    if not ok:
+                        bcp_stop = j
+                        break
+                    if implied:
+                        extras[j] = implied
+                st['bcp_time'] += time.time() - tb
+                if bcp_stop is not None:
+                    st['bcp_skipped_probes'] += n - bcp_stop + 1
+                    if bcp_stop < n:
+                        bcp_min[job_id] = bcp_stop
+                        st['bcp_shortened'] += 1
+                        st['bcp_removed_lits'] += n - bcp_stop
             # Prefixes j = 1..n-1 shorten; j = n is the grade-adequacy
             # diagnostic (a clause whose FULL pin set does not verify at
-            # this grade can never shorten here).
-            for j in range(1, n + 1):
+            # this grade can never shorten here). BCP-conflicted prefixes
+            # (j >= bcp_stop) are already entailed and are not probed.
+            j_max = (bcp_stop - 1) if bcp_stop is not None else n
+            for j in range(1, j_max + 1):
                 if len(cand_pins) >= self.budget:
                     break
                 # Pin the NEGATIONS of the prefix literals: the negation
                 # of the literal for coefficient s is "phase(s)".
-                cand_pins.append(list(lits[:j]))
+                extra = extras.get(j, [])
+                st['bcp_pins'] += len(extra)
+                cand_pins.append(list(lits[:j]) + list(extra))
                 cand_key.append((job_id, j))
-        if not cand_pins:
+        if not cand_pins and not bcp_min:
             return
         t0 = time.time()
-        undo = self._swap_net_state()
-        try:
-            with torch.no_grad():
-                results = self._probe_all(cand_pins)
-        finally:
-            undo()
+        results = []
+        if cand_pins:
+            undo = self._swap_net_state()
+            pool_undo = None
+            try:
+                if (self.use_cuts_mode == 'pool' and self.grade == 'beta'
+                        and arguments.Config['bab']['cut']['bab_cut']):
+                    pool_undo = self._install_probe_cut_pool(cuts, pool_cuts)
+                with torch.no_grad():
+                    results = self._probe_all(cand_pins)
+            finally:
+                if pool_undo is not None:
+                    pool_undo()
+                undo()
         self.budget -= len(cand_pins)
         st['probes'] += len(cand_pins)
         st['gpu_time'] += time.time() - t0
-        # Fold results: minimal verified prefix per clause.
-        min_j = {}
+        # Fold results: minimal verified prefix per clause (BCP conflicts
+        # seed the fold; GPU results can only improve on them).
+        min_j = dict(bcp_min)
         for (job_id, j), ok in zip(cand_key, results):
             n = len(jobs[job_id][1])
             if j == n:
@@ -1474,6 +1619,17 @@ class ClauseVivifier:
             st['removed_lits'] += len(lits) - j
             st['shortened'] += 1
             self._rewrite(cut, lits[:j])
+        bcp_part = ''
+        if bcp_layer is not None:
+            bcp_part = (f"bcp_shortened={st['bcp_shortened']} "
+                        f"(-{st['bcp_removed_lits']} lits, 0 GPU), "
+                        f"bcp_pins={st['bcp_pins']}, "
+                        f"bcp_skipped_probes={st['bcp_skipped_probes']}, "
+                        f"bcp_time={st['bcp_time']:.2f}s, ")
+        pool_part = ''
+        if st['cut_pool_rounds']:
+            pool_part = (f"probe_cut_pool={st['cut_pool_size']} cuts "
+                         f"({st['cut_pool_rounds']} rounds), ")
         print('Phase probing joint vivification: '
               f'{len(min_j)} of {len(jobs)} clauses shortened this round '
               f'({len(cand_pins)} probes, {time.time() - t0:.2f}s); '
@@ -1483,7 +1639,8 @@ class ClauseVivifier:
               f"(root-screened {st['removed_root']}), "
               f"full-pin verified {st['full_verified']}/{st['full_tested']}, "
               f"probes={st['probes']}, gpu_time={st['gpu_time']:.2f}s, "
-              f'budget_left={self.budget}, '
+              + bcp_part + pool_part
+              + f'budget_left={self.budget}, '
               f"len_hist={dict(sorted(st['len_hist'].items()))}")
 
 
