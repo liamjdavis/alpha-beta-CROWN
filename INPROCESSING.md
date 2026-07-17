@@ -594,3 +594,46 @@ Transferable laws (measured in Marabou, assume they hold here):
 - The oracle doubles as a runtime soundness audit: any unsound clause in
   any channel surfaces as a premature boolean conflict long before it
   corrupts a verdict.
+
+## Roadmap: getting better on alpha-beta-CROWN (priority order, 2026-07-16)
+
+The biggest available wins are RECOVERIES, not features — fix the cluster
+regressions before building anything new.
+
+1. **Budget-aware inprocessing gating** (fixes the largest measured loss).
+   The viv+SAT cluster arm loses ~64 cifar100 instances (safe 117→63,
+   other 51→115) to timeout starvation: 16–40s of flat inprocessing spend
+   inside ~100s instance budgets. Scale every inprocessing stage to the
+   remaining timeout: skip probing/vivification when
+   remaining_budget < k × expected_cost, engage vivification only if BaB
+   is still alive after N rounds, and let vivify_iterations degrade
+   (20 → 10 → skip) as budget tightens. SAT-solver duties (BCP pre-pass,
+   the planned mirror-oracle duties) are exempt — they are microseconds
+   and should always run. Success metric: cifar100 viv+SAT arm returns to
+   >= control's 117 safe while keeping its wins elsewhere.
+2. **cifar_cnn_b_adv probing-arm autopsy** (~44 instances lost by probing
+   alone, yet viv+SAT RESCUES it — 96/70 vs control 95/70). Isolate which
+   probing channel hurts there (hull write-backs? implied cuts? alpha
+   retention interplay?) with single-instance ablations before the next
+   cluster round. The rescue-by-viv+SAT inversion suggests a trajectory
+   effect, not a cost effect — compare per-instance wall times first to
+   split cost-vs-trajectory.
+3. **Mirror-oracle duties on the SAT layer** (see the port plan above):
+   per-OR-group UNSAT certificates, boolean failed-literal probing,
+   get_core vivification — all zero-GPU, all runnable at EVERY BICCOS
+   round (the cadence advantage over Marabou). These directly reduce
+   overhead: each duty replaces GPU-milliseconds with CPU-microseconds.
+4. **Per-parent-domain alphas for the vivify oracle** (the measured
+   strength ceiling: 60–75% of full pins do not re-verify off stale
+   batch-1 alpha slices). Only after 1–3: it ADDS GPU cost, so it needs
+   the budget gating in place first.
+5. **Long-clause benchmarks for the cluster** (idx7-like: clauses 4–6+
+   literals). The 2-literal pools of most cifar100 instances cap
+   vivification at forced-phase conversions; oval21/22, sri_resnet, and
+   BaB-hard families with deep trees are where multi-literal descent and
+   the SAT layer's cross-domain transfer have room. Also re-run one family
+   with the FULL treated stack so `viv lines`/`sat lines` are finally
+   nonzero at scale — those subsystems still have zero cluster exposure.
+6. **SAT-layer phases into branching proposals** (untried): implied phases
+   currently only clamp bounds; feeding them into split selection touches
+   the branching heuristic — measure carefully, trajectory-sensitive.
