@@ -1303,12 +1303,14 @@ class ClauseVivifier:
         # not from m.alpha, which the previous chunk overwrote with its own
         # batch size. All intermediate bounds are fixed, so only these are
         # optimized.
+        # requires_grad stays off: the probes do not optimize the alphas
+        # (see enable_alpha_crown below), they only read them as the
+        # relaxation the parent domain was bounded under.
         for m in self.net.get_enabled_opt_act():
             a = self._alpha_slice.get(m.name)
             if a is not None:
                 rep = [1, 1, B] + [1] * (a.dim() - 3)
-                m.alpha[self.final_name] = \
-                    a.repeat(*rep).requires_grad_(True)
+                m.alpha[self.final_name] = a.repeat(*rep)
 
         new_x = expand_batch(self.x, B, device=self.device)
         C = self.cur_c.expand(B, -1, -1)
@@ -1323,14 +1325,32 @@ class ClauseVivifier:
         # config, so the probe-specific opts (in particular the
         # vivify_iterations override) must be applied AFTER it.
         self.model.set_crown_bound_opts('beta')
+        # The probes optimize the betas and the general (cut) betas ONLY:
+        # the alphas stay fixed at the parent slice, serving as the
+        # relaxation coefficients the probe is conditioned on. Measured
+        # 2026-07-19 on cifar100 idx0 (deterministic) and idx7: alpha
+        # re-optimization moves the full-pin adequacy diagnostic (idx0
+        # 489/569 -> 421/569, idx7 25.8% -> 20.7% when frozen) and changes
+        # the DELIVERABLE by nothing at all -- idx0 169 shortened / 171
+        # literals and idx7's GPU-attributable ~76 shortenings are
+        # identical trained or frozen. auto_LiRPA supports this directly
+        # via enable_alpha_crown (guards at optimized_bounds.py:362,913);
+        # with alphas out of the parameter group their gradients are no
+        # longer computed, which is where the saving actually comes from
+        # (an lr_alpha=0 freeze still pays for the backward pass).
+        opt_args = {
+            'enable_alpha_crown': False,
+            'enable_beta_crown': True,
+            'fix_interm_bounds': True,
+            'stop_criterion_func': never_stop,
+            'multi_spec_keep_func': None,
+            'iteration': self.iterations,
+        }
+        # Escape hatch for re-measurement only.
+        if os.environ.get('PHASE_PROBING_VIVIFY_OPT_ALPHA', '') == '1':
+            opt_args['enable_alpha_crown'] = True
         self.net.set_bound_opts({
-            'optimize_bound_args': {
-                'enable_beta_crown': True,
-                'fix_interm_bounds': True,
-                'stop_criterion_func': never_stop,
-                'multi_spec_keep_func': None,
-                'iteration': self.iterations,
-            },
+            'optimize_bound_args': opt_args,
             'enable_opt_interm_bounds': False,
         })
         # Verify WITH the GCP-CROWN cut pool, exactly like BICCOS's own
@@ -1410,8 +1430,14 @@ class ClauseVivifier:
                              if s != self.final_name]:
                     saved_nonfinal.setdefault(name, {})[spec] = \
                         m.alpha.pop(spec)
-        prev_beta = self.net.bound_opts['optimize_bound_args'][
-            'enable_beta_crown']
+        # BOTH gates must be saved: the probes disable alpha optimization
+        # (see the enable_alpha_crown note in _run_chunk) and leaving that
+        # on the net starves every subsequent BaB bound computation --
+        # measured 2026-07-19, cifar100 idx0 safe 73s -> unknown 114s at
+        # 400 domains when only enable_beta_crown was restored.
+        prev_opt = {
+            k: self.net.bound_opts['optimize_bound_args'][k]
+            for k in ('enable_alpha_crown', 'enable_beta_crown')}
         self.net.set_bound_opts(
             {'optimize_bound_args': {'enable_beta_crown': False}})
         prev_cut_net = getattr(self.net, 'cut_used', False)
@@ -1426,8 +1452,7 @@ class ClauseVivifier:
                 acts[name].alpha[self.final_name] = a
             for name, entries in saved_nonfinal.items():
                 acts[name].alpha.update(entries)
-            self.net.set_bound_opts(
-                {'optimize_bound_args': {'enable_beta_crown': prev_beta}})
+            self.net.set_bound_opts({'optimize_bound_args': dict(prev_opt)})
             self.net.cut_used = prev_cut_net
             for m in self.net.splittable_activations:
                 if m.name in prev_cut_act:
@@ -1533,6 +1558,14 @@ class ClauseVivifier:
             self._gpu_run_key = gate_key
             self._gpu_dry = 0
         gpu_off = 0 < self.dry_rounds <= self._gpu_dry
+        # Measurement knob PHASE_PROBING_VIVIFY_NO_GPU=1: gate the GPU
+        # descent off from the first round (the dry-round gate taken to its
+        # limit) while every zero-GPU duty -- mirror cores, BCP,
+        # failed-literal probing, domain filtering -- keeps running. Prices
+        # the GPU vivification stage as a whole rather than one term inside
+        # its optimizer.
+        if os.environ.get('PHASE_PROBING_VIVIFY_NO_GPU', '') == '1':
+            gpu_off = True
         # BCP pre-pass source: the SAT layer's clause DB, scoped to THIS
         # run (this round's fresh clauses are mirrored only AFTER
         # vivification, so a clause never propagates against itself).
