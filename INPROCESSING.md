@@ -137,6 +137,14 @@ Strongest measured treated variant (see the closed-loop, BCP and
 mirror-oracle sections below): add `--phase_probing_vivify_use_cuts pool
 --phase_probing_mirror --phase_probing_vivify_dry_rounds 3` to the
 treated arm (`--phase_probing_vivify_bcp` is superseded by the mirror).
+"Strongest" here means most clauses shortened — on cifar100 that has NOT
+been shown to reduce the search (see the GPU-descent graveyard entry);
+the ranking is by clause counters, which this doc's protocol section now
+warns against trusting alone.
+
+For the next cluster sweep, add `--phase_probing_reprobe` (built
+2026-07-19, default-off) as its own arm, ideally with a
+`--phase_probing_reprobe_budget 30` variant.
 
 Ablations: drop `--phase_probing_sat_layer` for vivification-only; drop
 `--phase_probing_vivify_joint` for SAT-layer-only (the SAT DB then holds
@@ -184,6 +192,9 @@ yaml block `solver: phase_probing:` (CLI in parentheses):
 | `vivify_use_cuts` (`--phase_probing_vivify_use_cuts`) | auto | GCP-CROWN cuts in the vivification oracle: auto (net's current module = previous rebuild's pool; round 1 cut-less) / off (ablation) / pool (probe-scoped module rebuilt per round from pool + pending + fresh clauses — the closed loop) |
 | `vivify_bcp` (`--phase_probing_vivify_bcp`) | false | unit-propagate each (clause, prefix) pin set through the SAT layer before GPU: conflicts shorten at zero GPU cost, implied literals become extra pins (needs `sat_layer`) |
 | `sat_layer` (`--phase_probing_sat_layer`) | false | CPU clause DB (PySAT/CaDiCaL): pick_out-time domain filtering + phase clamping |
+| `reprobe` (`--phase_probing_reprobe`) | false | conditioned re-probing at depth (see its section); needs `sat_layer` |
+| `reprobe_budget` (`--phase_probing_reprobe_budget`) | 15.0 | total wall-clock seconds of re-probing per instance |
+| `reprobe_max_neurons` (`--phase_probing_reprobe_max_neurons`) | 64 | top-N still-unstable neurons re-probed per pass |
 
 Env (measurement only): `PHASE_PROBING_GUROBI_MAX=N` caps gurobi-rung
 probes; `GRB_LICENSE_FILE` points at the Gurobi license (WLS works).
@@ -253,20 +264,21 @@ stashed around the probes (the optimizer's best-alpha indexing crashes on
 batch-mismatched entries), and beta/cut state is swapped out and restored
 around every call.
 
-Alpha-knob notes: the oracle already does per-probe alpha
-re-optimization — the batch-1 parent slice is repeated with
-`requires_grad` and CROWN-optimized trains each probe's copy — so the
-strength-vs-cost knob is the ITERATION COUNT (`vivify_iterations`,
-0 = inherit `solver:beta-crown:iteration`). The probing feature's
-retained-alpha-node set (`phase_probing_keep_alpha_nodes`) is
-structurally IRRELEVANT here: the vivifier fixes ALL intermediate bounds,
-so intermediate-start-node alphas are never consumed by its probes (and
-retention is released before BaB starts anyway). "0 iterations" is the
-alpha grade — measured dead above. Implementation trap: the iteration
-override must be applied AFTER `set_crown_bound_opts('beta')`, which
-stamps the config iteration count over `optimize_bound_args` (the first
-sweep silently ran every arm at 10 iterations; caught because two "arms"
-were byte-identical — incidentally a determinism check).
+Alpha-knob notes: the oracle is beta-CROWN + GCP-CROWN with the alphas
+held FIXED at the parent slice (`enable_alpha_crown: False`) — see
+"Alpha re-optimization is dead" in the graveyard for the measurement
+that removed it. `vivify_iterations` (0 = inherit
+`solver:beta-crown:iteration`) therefore now trains only the betas and
+the general (cut) betas. The probing feature's retained-alpha-node set
+(`phase_probing_keep_alpha_nodes`) is structurally IRRELEVANT here: the
+vivifier fixes ALL intermediate bounds, so intermediate-start-node
+alphas are never consumed by its probes (and retention is released
+before BaB starts anyway). "0 iterations" is the alpha grade — measured
+dead above. Implementation trap: the iteration override must be applied
+AFTER `set_crown_bound_opts('beta')`, which stamps the config iteration
+count over `optimize_bound_args` (the first sweep silently ran every arm
+at 10 iterations; caught because two "arms" were byte-identical —
+incidentally a determinism check).
 
 ### `vivify_iterations` sensitivity (single-trajectory runs, canonical default-settings arm, 2026-07-15)
 
@@ -506,6 +518,51 @@ Vivification on this trajectory: 70/687 shortened, full-pin 192/687.
 
 ## Graveyard / known limits
 
+- **Alpha re-optimization in the vivify oracle** (removed 2026-07-19).
+  The probes trained alphas, betas and general (cut) betas through one
+  parameter group, so `vivify_iterations` priced all three together and
+  the alphas' contribution had never been isolated. Freezing them moves
+  the full-pin adequacy DIAGNOSTIC (idx0 489/569 → 421/569, idx7 25.8%
+  → 20.7%) and the DELIVERABLE by nothing: idx0 stays at 169 shortened
+  / 171 literals, idx7's GPU-attributable ~76 shortenings are identical
+  across four trajectories. Now `enable_alpha_crown: False` — alphas
+  are fixed relaxation coefficients from the parent slice. Taking them
+  out of the parameter group (not `lr_alpha=0`, which still pays for
+  the backward pass) cut vivify GPU 41% on idx0, 16.4s → 9.7s. The
+  oracle is marginally weaker as a side effect (`enable_alpha_crown`
+  also skips `node.opt_start()`; idx0 settles at 166/169), which is
+  sound — fewer optimized parameters can only loosen a bound. Escape
+  hatch `PHASE_PROBING_VIVIFY_OPT_ALPHA=1`.
+  **Do not resurrect off an adequacy argument**: full-pin adequacy is
+  an oracle-strength diagnostic that has now twice moved freely while
+  the deliverable stood still (see the protocol note below).
+- **The GPU joint-pin descent, on cifar100** (kept, but measured to
+  change nothing on this family — 2026-07-19). GPU probes on vs off
+  (`PHASE_PROBING_VIVIFY_NO_GPU=1`, every zero-GPU duty still running),
+  clean pairs in one job:
+
+  | idx | shortened | domains ON | domains OFF | verdict |
+  |---|---|---|---|---|
+  | 0 | 169 | 1532 | 1532 | safe / safe |
+  | 3 | 82 | 1332 | 1332 | safe / safe |
+  | 4 | 0 | 1184 | 1184 | safe / safe |
+  | 5 | 116 | 12578 | 12066 | unknown / unknown |
+  | 7 | ~76 (GPU part) | 7450 | 9966 | unknown / unknown |
+
+  Zero verdict changes; identical domain counts on all three
+  deterministic instances; both timeout instances get equal or better
+  throughput WITHOUT it, at 1–33s of GPU each inside ~100s budgets.
+  The delivery channel is fine — probing + SAT move idx0 from the
+  BICCOS-only control's 2748 domains to 1532 (−44%) — vivification
+  specifically contributes nothing to that. Marabou converged on the
+  same place from the other direction: their mirror superseded the
+  hand-rolled LP-descent shortening machinery ("superseded, not
+  refuted"), and their descent runs at an 88–99% hit rate where ours
+  runs at 11–17%. NOT gated off by default yet — that flips the
+  meaning of every historical A/B, and the measurement is one config
+  family with mostly 2-literal clause pools. The doc's own long-clause
+  regime (idx7-like) is where multi-literal descent should pay and is
+  exactly where the timeout masks the outcome.
 - **Vivification at crown/alpha grade**: measured dead — 0/640 clauses
   shortened, 0/640 full-pin verified on cifar100 idx0. BICCOS clauses
   were verified at beta grade with per-run alphas and the cut pool; a
@@ -727,6 +784,93 @@ Transferable laws (measured in Marabou, assume they hold here):
   any channel surfaces as a premature boolean conflict long before it
   corrupts a verdict.
 
+## Conditioned re-probing at depth (ported 2026-07-19, `--phase_probing_reprobe`)
+
+The root probe runs pre-BaB, where the GCP-CROWN cut pool is EMPTY, so
+it is plain beta-CROWN **by construction** — `_PhaseProber`'s beta rung
+passes no `cutter=` and never flips `cut_used`. By the time BICCOS has
+inferred clauses the pool holds 30–242 cuts, and on this benchmark the
+pool is the entire source of oracle power (vivification idx0: 0/687
+shortened with cuts off, 119/697 with the pool). So re-probing here is
+NOT the Marabou original — theirs reruns the same DeepPoly/simplex
+stack under a smaller box; ours runs a **strictly stronger oracle than
+the root pass could ever have run**.
+
+Mechanics: whenever the SAT layer's run-scoped forced-phase set grows
+(`_flp_decided`, the level-0-fixed-set trigger; naive per Marabou —
+their density gate measured as a wash and was removed the same day),
+re-probe the still-unstable neurons with those forced phases pinned, at
+beta grade with the pool cuts. The forced phases ARE the box tightening
+and the beta oracle already expresses pins as clamps + SparseBeta
+splits, so a re-probe is just the pin set {forced phases} +
+{candidate}. A verified region ⇒ the pin is refuted ⇒ its negation is
+entailed. Facts are RUN-scoped (conditioned on this OR group's spec AND
+on the run's own forced phases): they enter `run_clauses` via
+`add_run_unit`, never the persistent DB, and ride the existing fact-cut
+channel into the pool.
+
+**The cut pool is load-bearing, and that is measured, not assumed.** A
+plain-CROWN premise diagnostic (`PHASE_PROBING_REPROBE_DIAG=1`) clamps
+the forced phases into the root box and recomputes: the box shrink
+ALONE moves 0 neurons on 3 of 5 idx0 passes, tightens by ~0.1% of box
+width (max 0.47%, vs the root probe's own 0.183 max), and stabilizes
+NOTHING. The same pins at beta grade with cuts refute 23 phases.
+Marabou's "density grows as boxes shrink" premise is weak here; what
+works is the oracle upgrade, not the box.
+
+Measured (cifar100, single trajectories, default-off so control arms
+are untouched):
+
+| idx | units found | re-probe time | domains OFF | domains ON | verdict |
+|---|---|---|---|---|---|
+| 0 | 23 | 5.8s | 2106 | 1486 | safe / safe |
+| 3 | 5 | 1.7s | 1332 | 1332 | safe / safe |
+| 5 | **93** | 4.0s | 12072 | 12586 | unknown / unknown |
+| 7 | 2 | 1.6s | 7926 | 7404 | unknown / unknown |
+
+No verdict changed anywhere, and no consistent search effect. The
+sharpest datum is **idx5**: it found by far the most facts (93) and
+visited MORE domains. idx3 is deterministic and 5 units moved it by
+exactly zero. **The idx0 −29% is NOT a treatment effect** — that
+instance is bimodal between ~1500 and ~2110 domains from identical
+code, and paired repeats put the OFF arm in BOTH modes (2106, 2106,
+1532) while ON stayed low (1486, 1502, 1500). Suggestive at best —
+3-of-3 low for ON vs 1-of-3 for OFF is not separation at n=3 on a
+bimodal instance. Do not quote the −29%.
+
+Lands default-off as machinery for a cluster sweep. Cost never bound:
+1.6–5.8s of the 15s budget, so a larger budget is nearly free to try.
+
+## Measurement protocol (read before trusting any number here)
+
+Four separate times, an intermediate metric of this subsystem moved
+independently of the outcome:
+
+1. full-pin adequacy tripled (28% → 70%) for +4 shortened clauses;
+2. 169 shortened clauses on idx0 changed domains visited by 0;
+3. a leaked bound option lost idx0 its verdict (safe 73s → unknown
+   114s at 400 domains) while `shortened` went UP, 169 → 177;
+4. re-probing's 93 units on idx5 came with MORE domains visited.
+
+So: **verdict and domains visited are the primary readout**; clause
+counters are diagnostics. Concretely —
+
+- run treated/control pairs in the SAME job (GPU free-memory couples
+  into trajectories via `auto_enlarge_batch_size`);
+- record the instance's noise floor before reading a delta. Measured:
+  idx3 deterministic (1332 across three different code paths); idx7
+  ±13% on shortened-clause count between byte-identical runs; **idx0
+  bimodal between ~1500 and ~2110 domains** — it is NOT deterministic,
+  despite earlier claims in this doc;
+- on timeout instances domains-visited is THROUGHPUT, not progress —
+  removing work raises it (idx7 vivify-off: 9966 vs 7450). Only the
+  verdict is meaningful there;
+- a knob that produces byte-identical arms is inert, not neutral. Two
+  such false arms were caught this way (an `lr_alpha`-free
+  `requires_grad` freeze, silently overridden by auto_LiRPA's
+  `_set_alpha` at `optimized_bounds.py:125`; and the original
+  `vivify_iterations` sweep).
+
 ## Roadmap: getting better on alpha-beta-CROWN (priority order, 2026-07-16)
 
 The biggest available wins are RECOVERIES, not features — fix the cluster
@@ -758,17 +902,46 @@ regressions before building anything new.
    gate (idx7 vivify GPU 30.8s → 3.1s). Remaining from the plan:
    learner harvest (duty 5, needs PySAT Learner access) and cluster
    exposure of the new arm.
-4. **Per-parent-domain alphas for the vivify oracle** (the measured
-   strength ceiling: 60–75% of full pins do not re-verify off stale
-   batch-1 alpha slices). Only after 1–3: it ADDS GPU cost, so it needs
-   the budget gating in place first.
-5. **Long-clause benchmarks for the cluster** (idx7-like: clauses 4–6+
+4. ~~**Per-parent-domain alphas for the vivify oracle**~~ — DROPPED
+   2026-07-19. It was motivated entirely by the full-pin adequacy gap
+   ("60–75% of full pins do not re-verify"), and adequacy is now
+   measured twice to be decoupled from the deliverable: removing alpha
+   optimization altogether dropped adequacy 14% and changed shortened
+   clauses by zero. Plumbing FRESHER alphas cannot be worth it when
+   removing them entirely costs nothing. Cuts, not alphas, are the
+   lever on this oracle (`use_cuts off` → 0/687 on idx0).
+5. **Cluster sweep of re-probing** (`--phase_probing_reprobe`, built
+   2026-07-19, default-off). Single trajectories on one family cannot
+   price a trajectory-mediated effect; the cluster can. Include a
+   `--phase_probing_reprobe_budget 30` arm — no instance came close to
+   the 15s cap, so a bigger budget is nearly free. Watch for idx5's
+   signature (most facts, MORE domains) at scale: if it holds, the
+   facts are actively misleading the branching heuristic rather than
+   being merely neutral, which is a different and more interesting
+   failure than vivification's.
+6. **Decide the GPU joint-pin descent** (see the graveyard entry).
+   Measured to change no verdict and no domain count on cifar100 at
+   1–33s/instance. Gating it off returns exactly the budget re-probing
+   wants. Needs either a long-clause family showing it pays, or a
+   cluster arm confirming the null, before the default flips.
+7. ~~**LP/MILP rung for the probes**~~ — PAUSED INDEFINITELY
+   2026-07-19 (user decision). The machinery exists and is cheap to
+   wire (`lp_mip_solver/bounds_core.py:99` `build_the_model_lp`, the
+   unused `lp_solver` worker at `:41`, `update_model_bounds` at `:293`,
+   `copy_model` at `utils.py:259`, the `BestBdStop`/`objbound` trick at
+   `refine_core.py:489`, and the `NestablePool` already cached on
+   `m.pool`). It is not worth building: the gurobi rung ALREADY ran
+   exact MILP at 30s/probe and closed nothing, and exact MILP dominates
+   any LP relaxation — a cheaper approximation finds the same nothing
+   faster. Root probing is deficit-limited (a single pin cannot close
+   the ~1.0 output deficit), not oracle-limited.
+8. **Long-clause benchmarks for the cluster** (idx7-like: clauses 4–6+
    literals). The 2-literal pools of most cifar100 instances cap
    vivification at forced-phase conversions; oval21/22, sri_resnet, and
    BaB-hard families with deep trees are where multi-literal descent and
    the SAT layer's cross-domain transfer have room. Also re-run one family
    with the FULL treated stack so `viv lines`/`sat lines` are finally
    nonzero at scale — those subsystems still have zero cluster exposure.
-6. **SAT-layer phases into branching proposals** (untried): implied phases
+9. **SAT-layer phases into branching proposals** (untried): implied phases
    currently only clamp bounds; feeding them into split selection touches
    the branching heuristic — measure carefully, trajectory-sensitive.
