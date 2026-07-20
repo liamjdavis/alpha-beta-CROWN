@@ -372,6 +372,36 @@ class PhaseSATLayer:
                   f"solves={self.stats['flp_solves']}, "
                   f"time={self.stats['flp_time']:.3f}s).")
 
+    def add_run_unit(self, ridx, nidx, sign, run_key):
+        """Install a run-scoped forced phase derived outside the boolean
+        layer (conditioned re-probing at depth; see
+        ClauseVivifier.reprobe). RUN-scoped, never persistent: the fact is
+        conditioned on this OR group's spec AND on the run's other forced
+        phases, so it must die with the run's DB flush.
+
+        Returns True if the unit is new. The literal also joins
+        _new_unit_lits, so it rides the existing fact-cut channel into the
+        GCP-CROWN pool exactly like a failed-literal unit.
+        """
+        if run_key is None or self.run_unsat:
+            return False
+        if run_key != self.run_key:
+            self._flush_run(run_key)
+        lit = self._lit_int(ridx, nidx, sign)
+        if lit is None:
+            return False
+        key = frozenset([lit])
+        if key in self._seen or lit in self._flp_decided:
+            return False
+        self._seen.add(key)
+        self._flp_decided.add(lit)
+        self.run_clauses.append([lit])
+        if self._solver is not None:
+            self._solver.add_clause([lit])
+        self._new_unit_lits.append(lit)
+        self.stats['reprobe_units'] = self.stats.get('reprobe_units', 0) + 1
+        return True
+
     def pop_new_cut_facts(self):
         """SAT-derived facts as GCP-CROWN blocking-clause cuts for the
         current run's BICCOS pool, so every subproblem's relaxation gets

@@ -512,6 +512,26 @@ class ConfigHandler:
                                'passes (mirror cores / BCP conflicts); the CPU-side duties keep running. 0 = never '
                                'gate. Takes GPU overhead out of runs whose clause pools have stopped yielding.',
                           hierarchy=h + ["vivify_dry_rounds"])
+        self.add_argument("--phase_probing_reprobe", action='store_true',
+                          dest='phase_probing_reprobe', default=False,
+                          help='Conditioned re-probing at depth (ported from Marabou): whenever the SAT layer\'s '
+                               'run-scoped forced-phase set grows, re-probe the still-unstable neurons with those '
+                               'forced phases pinned, at beta grade WITH the GCP-CROWN cut pool. Unlike the root '
+                               'probe -- which runs pre-BaB where the cut pool is empty, so it is plain beta-CROWN '
+                               'by construction -- this is a strictly stronger oracle than the root pass could '
+                               'have run. Refuted pins become run-scoped forced phases feeding the SAT layer and '
+                               'the fact-cut channel. Requires --phase_probing_sat_layer.',
+                          hierarchy=h + ["reprobe"])
+        self.add_argument("--phase_probing_reprobe_budget", type=float, default=15.0,
+                          help='Total wall-clock seconds of re-probing per instance (Marabou uses one global cap '
+                               'with no per-pass filtering; their density gate measured as a wash and was '
+                               'removed). Passes stop being issued once the budget is spent.',
+                          hierarchy=h + ["reprobe_budget"])
+        self.add_argument("--phase_probing_reprobe_max_neurons", type=int, default=64,
+                          help='Top-N still-unstable neurons re-probed per pass, ranked by the root pass\'s hull '
+                               'gain. Selection is budget allocation, never soundness: a skipped probe loses a '
+                               'fact, it cannot produce a wrong one.',
+                          hierarchy=h + ["reprobe_max_neurons"])
         self.add_argument("--phase_probing_fact_cuts_max", type=int, default=50,
                           help='Per-run cap on SAT-derived fact cuts (failed-literal units, implication edges) '
                                'injected into the BICCOS pool. Every installed cut is a general-beta constraint '

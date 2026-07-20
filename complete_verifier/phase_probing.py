@@ -1134,12 +1134,22 @@ class ClauseVivifier:
         # GPU-side shortening, stop spending GPU on this run (the CPU
         # passes keep running). 0 = off.
         self.dry_rounds = cfg['vivify_dry_rounds']
+        # Conditioned re-probing at depth (see reprobe()).
+        self.reprobe_enabled = cfg['reprobe']
+        self.reprobe_budget = cfg['reprobe_budget']
+        self.reprobe_max_neurons = cfg['reprobe_max_neurons']
         self._gpu_dry = 0
         self._gpu_run_key = None
         self.batch_size = max(2, cfg['batch_size'])
         self.interm_names = list(prober.interm_names)
         self.preact_of_relu_idx = {
             v: k for k, v in prober.relu_idx_of_preact.items()}
+        # Re-probe premise diagnostic (measurement only, see
+        # _reprobe_premise_diagnostic).
+        self.relu_idx_of_preact = dict(prober.relu_idx_of_preact)
+        self.node_order = dict(prober.node_order)
+        self.unstable_mask = {k: v.clone()
+                              for k, v in prober.unstable_mask.items()}
         # Refined root bounds (the bounds BaB starts from; forced-phase
         # clamps included -- spec-conditional like the clauses themselves).
         self.base_lb = {k: prober.ref_lb[k].detach().cpu()
@@ -1249,6 +1259,245 @@ class ClauseVivifier:
                 else:
                     probe_ib[name][1].view(B, -1)[j, nidx] = 0.  # pin INACTIVE
         return probe_ib
+
+    def _reprobe_premise_diagnostic(self, sat_layer):
+        """Measurement-only (PHASE_PROBING_REPROBE_DIAG=1): price the
+        re-probe premise BEFORE building re-probing.
+
+        Marabou's conditioned re-probing rests on "density grows as boxes
+        shrink": once the level-0 fixed set grows, re-deriving facts under
+        the tightened box finds things the root pass could not. The
+        abcrown equivalent of that fixed set is the SAT layer's run-scoped
+        forced phases (failed-literal units + mirror-derived units). This
+        clamps them into the refined root box, recomputes intermediate
+        bounds ONCE (batch 1, crown, all-fixed-upstream -- milliseconds),
+        and reports what actually moved:
+
+          fixed   -- run-scoped forced phases available to clamp
+          moved   -- unstable neurons whose pre-activation bounds changed
+          newstab -- unstable neurons the clamps alone made STABLE (these
+                     are free: no probe needed, and they leave the probe
+                     target set)
+          tighten -- mean/max relative box tightening over moved neurons
+
+        A pass where nothing moves means re-probing would re-derive the
+        root pass's own results at full cost -- exactly the zero-fact
+        passes that cost Marabou instance 2_1 its verdict. This tells us
+        the firing rate and the yield ceiling before any GPU is spent.
+        """
+        st = self.stats
+        decided = getattr(sat_layer, '_flp_decided', None)
+        if not decided:
+            return
+        n_fixed = len(decided)
+        if n_fixed == st.get('reprobe_last_fixed', 0):
+            return  # trigger: growth of the level-0 fixed set
+        st['reprobe_last_fixed'] = n_fixed
+        st['reprobe_passes'] = st.get('reprobe_passes', 0) + 1
+        name_of_var = {v: k for k, v in sat_layer._var_of.items()}
+        pins = []
+        for lit in decided:
+            entry = name_of_var.get(abs(lit))
+            if entry is None:
+                continue
+            name, nidx = entry
+            ridx = self.relu_idx_of_preact.get(name)
+            if ridx is not None:
+                pins.append((ridx, nidx, 1 if lit > 0 else -1))
+        if not pins:
+            return
+        t0 = time.time()
+        undo = self._swap_net_state()
+        try:
+            probe_ib = self._pinned_interm_bounds([pins])
+            # Keep the layers that CARRY the clamps (the pinned ones) plus
+            # everything upstream of the earliest pin, and FREE the rest so
+            # their bounds are recomputed under the clamps. Passing a layer
+            # in interm_bounds fixes it, so dropping the pinned layers here
+            # would silently delete the clamps and measure the root box
+            # against itself.
+            pinned_names = {self.preact_of_relu_idx[r] for (r, _, _) in pins}
+            first = min(self.node_order[n] for n in pinned_names)
+            probe_ib = {k: v for k, v in probe_ib.items()
+                        if k in pinned_names or self.node_order[k] < first}
+            n_free = len(self.interm_names) - len(probe_ib)
+            # Two recomputations, IDENTICAL except for the clamps: the
+            # baseline must use the same method and the same freed layers,
+            # or the comparison measures the method rather than the pins.
+            # (Comparing against base_lb/base_ub -- alpha-CROWN optimized
+            # and hull-refined -- floors every delta to zero: plain CROWN
+            # is looser than that baseline everywhere.)
+            def _recompute(ib):
+                with torch.no_grad():
+                    self.net.compute_bounds(
+                        x=(expand_batch(self.x, 1, device=self.device),),
+                        C=self.cur_c, method='backward',
+                        interm_bounds=ib, bound_upper=False)
+                return {k: (self.net[k].lower.detach().clone(),
+                            self.net[k].upper.detach().clone())
+                        for k in self.interm_names
+                        if k not in ib and k in self.unstable_mask
+                        and self.net[k].lower is not None
+                        and self.net[k].upper is not None}
+
+            unclamped = {k: [self.base_lb[k].to(self.device),
+                             self.base_ub[k].to(self.device)]
+                         for k in probe_ib}
+            ref = _recompute(unclamped)
+            cur = _recompute(probe_ib)
+            moved = newstab = 0
+            rels = []
+            for k, (nl_t, nu_t) in cur.items():
+                if k not in ref:
+                    continue
+                um = self.unstable_mask[k]
+                if not bool(um.any()):
+                    continue
+                nl = nl_t.reshape(-1)[um]
+                nu = nu_t.reshape(-1)[um]
+                ol = ref[k][0].reshape(-1)[um]
+                ou = ref[k][1].reshape(-1)[um]
+                width = (ou - ol).clamp(min=1e-12)
+                delta = ((nl - ol).clamp(min=0) + (ou - nu).clamp(min=0))
+                hit = delta > 1e-6
+                moved += int(hit.sum())
+                newstab += int(((nl >= 0) | (nu <= 0)).sum())
+                if bool(hit.any()):
+                    rels.append((delta / width)[hit])
+            rel = torch.cat(rels) if rels else torch.zeros(1)
+            st['reprobe_moved'] = st.get('reprobe_moved', 0) + moved
+            st['reprobe_newstab'] = st.get('reprobe_newstab', 0) + newstab
+            st['reprobe_diag_time'] = (st.get('reprobe_diag_time', 0.)
+                                       + time.time() - t0)
+            print(f'Phase probing re-probe premise: pass '
+                  f"{st['reprobe_passes']} -- fixed={n_fixed} "
+                  f'({len(pins)} clampable, {n_free} layers recomputed), '
+                  f'moved={moved}, '
+                  f'newly_stable={newstab}, tighten avg='
+                  f'{float(rel.mean()):.6f} max={float(rel.max()):.6f}, '
+                  f'{time.time() - t0:.3f}s (cumulative: '
+                  f"passes={st['reprobe_passes']}, moved={st['reprobe_moved']}, "
+                  f"newly_stable={st['reprobe_newstab']}, "
+                  f"time={st['reprobe_diag_time']:.2f}s).")
+        except Exception as e:
+            print(f'Phase probing re-probe premise: diagnostic failed ({e!r}).')
+        finally:
+            undo()
+
+    def reprobe(self, sat_layer, run_key, pool_cuts=None):
+        """Conditioned re-probing at depth (ported from Marabou).
+
+        The root probe pass runs pre-BaB, where the GCP-CROWN cut pool is
+        EMPTY -- it is plain beta-CROWN by construction. By the time BaB
+        has inferred clauses the pool holds tens to hundreds of cuts, and
+        on the calibration instance the pool is the entire source of
+        oracle power (idx0 vivification: 0/687 shortened with cuts off,
+        119/697 with the pool). So re-probing here is not a repeat of the
+        root pass under a smaller box -- it is a STRICTLY STRONGER oracle
+        than the root pass could ever have run, which is the structural
+        difference from the Marabou original (their re-probe reruns the
+        same stack).
+
+        The run's forced phases are the box tightening, and the beta-grade
+        oracle already expresses pins as clamps + SparseBeta splits, so
+        the re-probe of candidate neuron j is simply the pin set
+        {forced phases} + {j pinned}. If that region verifies, the pin is
+        refuted and its NEGATION is a forced phase -- run-scoped, exactly
+        like the clauses it was derived alongside.
+
+        Facts go into the run DB (flushed on run change), never the
+        persistent one: they are conditioned on this OR group's spec and
+        on run-scoped forced phases.
+        """
+        st = self.stats
+        decided = getattr(sat_layer, '_flp_decided', None)
+        if not decided or run_key is None:
+            return
+        if len(decided) == st.get('reprobe_last_fixed', 0):
+            return  # trigger: growth of the level-0 fixed set
+        st['reprobe_last_fixed'] = len(decided)
+        budget = self.reprobe_budget
+        if st.get('reprobe_time', 0.) >= budget:
+            return
+        max_n = self.reprobe_max_neurons
+        name_of_var = {v: k for k, v in sat_layer._var_of.items()}
+
+        base_pins, decided_keys = [], set()
+        for lit in decided:
+            entry = name_of_var.get(abs(lit))
+            if entry is None:
+                continue
+            name, nidx = entry
+            ridx = self.relu_idx_of_preact.get(name)
+            if ridx is not None:
+                base_pins.append((ridx, nidx, 1 if lit > 0 else -1))
+                decided_keys.add((ridx, nidx))
+        if not base_pins:
+            return
+
+        # Candidates: still-unstable neurons that are not already decided,
+        # ranked by the root pass's hull gain (the neurons whose pins moved
+        # the box most are the ones most likely to refute under a tighter
+        # box + cuts). Cheap proxy; selection is budget allocation, never
+        # soundness -- a skipped probe loses a fact, it cannot produce a
+        # wrong one.
+        cands = []
+        for (ridx, nidx), gain in self.pair_gain.items():
+            if (ridx, nidx) not in decided_keys:
+                cands.append((gain, ridx, nidx))
+        if not cands:
+            return
+        cands.sort(reverse=True)
+        cands = cands[:max_n]
+
+        t0 = time.time()
+        st['reprobe_passes'] = st.get('reprobe_passes', 0) + 1
+        pins_per_probe, keys = [], []
+        for (_, ridx, nidx) in cands:
+            for sign in (1, -1):
+                pins_per_probe.append(base_pins + [(ridx, nidx, sign)])
+                keys.append((ridx, nidx, sign))
+
+        undo = self._swap_net_state()
+        pool_undo = None
+        new_units = 0
+        try:
+            if (self.use_cuts_mode == 'pool' and self.grade == 'beta'
+                    and arguments.Config['bab']['cut']['bab_cut']):
+                pool_undo = self._install_probe_cut_pool([], pool_cuts)
+            for i in range(0, len(pins_per_probe), self.batch_size):
+                if time.time() - t0 > budget - st.get('reprobe_time', 0.):
+                    st['reprobe_truncated'] = st.get('reprobe_truncated', 0) + 1
+                    break
+                chunk = pins_per_probe[i:i + self.batch_size]
+                verified = self._run_chunk(chunk)
+                st['reprobe_probes'] = st.get('reprobe_probes', 0) + len(chunk)
+                for j, ok in enumerate(verified.tolist()):
+                    if not ok:
+                        continue
+                    # The pinned region verified => no counterexample of
+                    # this run lies in it => the pin is refuted and its
+                    # negation is entailed for this run.
+                    ridx, nidx, sign = keys[i + j]
+                    if sat_layer.add_run_unit(ridx, nidx, -sign, run_key):
+                        new_units += 1
+        except Exception as e:
+            print(f'Phase probing re-probe: pass failed ({e!r}).')
+        finally:
+            if pool_undo is not None:
+                pool_undo()
+            undo()
+        st['reprobe_units'] = st.get('reprobe_units', 0) + new_units
+        st['reprobe_time'] = st.get('reprobe_time', 0.) + time.time() - t0
+        print(f"Phase probing re-probe: pass {st['reprobe_passes']} -- "
+              f'{len(base_pins)} forced phases pinned, {len(cands)} neurons '
+              f'({len(pins_per_probe)} probes) at {self.grade} grade'
+              f"{' + pool cuts' if pool_undo is not None else ''}, "
+              f'{new_units} new forced phases, {time.time() - t0:.2f}s '
+              f"(cumulative: passes={st['reprobe_passes']}, "
+              f"probes={st.get('reprobe_probes', 0)}, "
+              f"units={st['reprobe_units']}, "
+              f"time={st['reprobe_time']:.2f}s / {budget:.0f}s budget).")
 
     def _verified(self, lb_out):
         """lb_out: [B, spec] output lower bounds on the pinned regions.
@@ -1558,6 +1807,16 @@ class ClauseVivifier:
             self._gpu_run_key = gate_key
             self._gpu_dry = 0
         gpu_off = 0 < self.dry_rounds <= self._gpu_dry
+        _sl = getattr(self.model, 'phase_probing_sat_layer', None)
+        # PHASE_PROBING_REPROBE_DIAG=1: price the re-probe premise only
+        # (plain CROWN, no behavior change -- a LOWER bound on movement,
+        # since the real oracle is beta grade + pool cuts).
+        if os.environ.get('PHASE_PROBING_REPROBE_DIAG', '') == '1' \
+                and _sl is not None:
+            self._reprobe_premise_diagnostic(_sl)
+        # Conditioned re-probing at depth (see reprobe()).
+        if self.reprobe_enabled and _sl is not None:
+            self.reprobe(_sl, _sl.run_key_of(cs, rhs), pool_cuts)
         # Measurement knob PHASE_PROBING_VIVIFY_NO_GPU=1: gate the GPU
         # descent off from the first round (the dry-round gate taken to its
         # limit) while every zero-GPU duty -- mirror cores, BCP,
