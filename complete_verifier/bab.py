@@ -489,6 +489,28 @@ def multi_tree_bab(
     net.domain_interm_factory.construct_interm_bounds_in_d(
         initial_domain, net.unstable_mask
     )
+
+    # ---------------- phase probing start ----------------
+    # Clause-DB clamping for the multi-tree path. act_split_round filters its
+    # picked batch, but multi_tree_bab's pick_out sites never consulted the
+    # SAT layer at all -- measured: only 134 of 1,934 domains on cifar100 idx0
+    # were ever checked (7%), so every fact we deliver through the SAT layer
+    # (units, re-probe forced phases, implication edges) was invisible to 93%
+    # of the search. That is why each delivery channel measured at exactly
+    # 1.000x domains.
+    #
+    # prune=False on purpose: propagation over the whole DB is cheap, but
+    # REMOVING domains here is not safe -- these batches feed MTS's tree
+    # restore, and an emptied batch trips
+    # restore_best_domains -> _generate_tree's `assert best_node is not None`.
+    # Clamping is sound and monotone (it only tightens bounds), so it delivers
+    # the DB's information without that structural risk.
+    _pp_sat = getattr(net, "phase_probing_sat_layer", None)
+    if _pp_sat is not None:
+        _pp_sat.process_picked_domains(
+            initial_domain, _pp_sat.run_key_of(initial_domain.get("cs"), initial_domain.get("thresholds")),
+            prune=False)
+    # ----------------- phase probing end ------------------
     initial_ret = net.update_bounds(
         initial_domain,
         fix_interm_bounds=True,
@@ -597,6 +619,28 @@ def multi_tree_bab(
         print("Shallow branching resets to n domains: ", len(domains))
         base_d = domains.pick_out(batch=len(domains), device=net.device)
         net.domain_interm_factory.construct_interm_bounds_in_d(base_d, net.unstable_mask)
+
+        # ---------------- phase probing start ----------------
+        # Clause-DB clamping for the multi-tree path. act_split_round filters its
+        # picked batch, but multi_tree_bab's pick_out sites never consulted the
+        # SAT layer at all -- measured: only 134 of 1,934 domains on cifar100 idx0
+        # were ever checked (7%), so every fact we deliver through the SAT layer
+        # (units, re-probe forced phases, implication edges) was invisible to 93%
+        # of the search. That is why each delivery channel measured at exactly
+        # 1.000x domains.
+        #
+        # prune=False on purpose: propagation over the whole DB is cheap, but
+        # REMOVING domains here is not safe -- these batches feed MTS's tree
+        # restore, and an emptied batch trips
+        # restore_best_domains -> _generate_tree's `assert best_node is not None`.
+        # Clamping is sound and monotone (it only tightens bounds), so it delivers
+        # the DB's information without that structural risk.
+        _pp_sat = getattr(net, "phase_probing_sat_layer", None)
+        if _pp_sat is not None:
+            _pp_sat.process_picked_domains(
+                base_d, _pp_sat.run_key_of(base_d.get("cs"), base_d.get("thresholds")),
+                prune=False)
+        # ----------------- phase probing end ------------------
         new_ret = net.update_bounds(
             base_d,
             fix_interm_bounds=True,

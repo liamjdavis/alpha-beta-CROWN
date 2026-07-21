@@ -82,6 +82,8 @@ class PhaseSATLayer:
         self._flp_decided = set()    # literals already known unit this run
         self._new_unit_lits = []     # flp units not yet exported as cuts
         self._edges_exported = False  # persistent edges exported this run
+        self._run_edge_cursor = 0     # run_clauses exported as cuts so far
+        self._clause_score = {}       # frozenset(clause) -> strength score
         self.stats = {
             'domains_checked': 0, 'domains_pruned': 0, 'phases_clamped': 0,
             'clauses': 0, 'run_flushes': 0, 'time': 0.0,
@@ -152,6 +154,8 @@ class PhaseSATLayer:
             self._flp_decided = set()
             self._new_unit_lits = []
             self._edges_exported = False
+            self._run_edge_cursor = 0
+            self._clause_score = {}
             self._fact_cuts_emitted = 0
 
     def add_blocking_cuts(self, cuts, run_key):
@@ -372,6 +376,46 @@ class PhaseSATLayer:
                   f"solves={self.stats['flp_solves']}, "
                   f"time={self.stats['flp_time']:.3f}s).")
 
+    def add_run_edge(self, src_ridx, src_nidx, src_sign,
+                     tgt_ridx, tgt_nidx, tgt_sign, run_key, score=0.0):
+        """Install a run-scoped binary implication (src literal => tgt phase)
+        derived by conditioned re-probing.
+
+        Stored as the clause (-src OR tgt), the same encoding the ROOT probe's
+        persistent implication edges use -- so the mirror oracle and unit
+        propagation treat it identically. RUN-scoped for the same reason as
+        add_run_unit: the edge is conditioned on this OR group's spec AND on
+        the run's other forced phases, so it must die with the run's flush.
+
+        Returns True if the clause is new.
+        """
+        if run_key is None or self.run_unsat:
+            return False
+        if run_key != self.run_key:
+            self._flush_run(run_key)
+        src = self._lit_int(src_ridx, src_nidx, src_sign)
+        tgt = self._lit_int(tgt_ridx, tgt_nidx, tgt_sign)
+        if src is None or tgt is None or src == tgt:
+            return False
+        clause = sorted([-src, tgt])
+        key = frozenset(clause)
+        if key in self._seen or key in self._persistent_keys:
+            return False
+        self._seen.add(key)
+        self.run_clauses.append(clause)
+        # Strength score decides which edges win the scarce cut budget (see
+        # pop_new_cut_facts): every installed cut is a general-beta constraint
+        # carried by EVERY subproblem's bounding call, so the cap is a cost
+        # limit, not a quality one -- the Lagrangian would happily drive a
+        # useless cut's multiplier to zero, but we would still pay for it on
+        # every domain forever. Same sacrifice BICCOS makes with number_cuts.
+        self._clause_score[key] = max(self._clause_score.get(key, 0.0),
+                                      float(score))
+        if self._solver is not None:
+            self._solver.add_clause(clause)
+        self.stats['clauses'] += 1
+        return True
+
     def add_run_unit(self, ridx, nidx, sign, run_key):
         """Install a run-scoped forced phase derived outside the boolean
         layer (conditioned re-probing at depth; see
@@ -422,9 +466,34 @@ class PhaseSATLayer:
             return []
         lits_lists = [[l] for l in self._new_unit_lits[:budget]]
         self._new_unit_lits = self._new_unit_lits[len(lits_lists):]
-        if not self._edges_exported and len(lits_lists) < budget:
-            self._edges_exported = True
-            edges = [c for c in self.persistent if len(c) == 2]
+        if len(lits_lists) < budget:
+            # Binary clauses as 2-literal cuts. BOTH sources:
+            #   persistent -- root-probe implication edges, box-sound, exported
+            #                 once per run (they never change within a run);
+            #   run_clauses -- edges harvested by conditioned re-probing, which
+            #                 accumulate as the run progresses, so they are
+            #                 exported incrementally (a cursor, not a flag).
+            # Feeding the CUTTER is the point: a clause sitting in the boolean
+            # DB only filters picked domains, and that was measured inert
+            # (15,708 re-probe edges -> 0 change in domains visited). As a
+            # GCP-CROWN cut the same clause enters every subproblem's
+            # relaxation with an optimized multiplier, exactly like a BICCOS
+            # blocking clause.
+            edges = []
+            if not self._edges_exported:
+                self._edges_exported = True
+                edges += [c for c in self.persistent if len(c) == 2]
+            new_run_edges = self.run_clauses[self._run_edge_cursor:]
+            self._run_edge_cursor = len(self.run_clauses)
+            # STRONGEST FIRST. Re-probing can harvest thousands of edges per
+            # pass; the budget takes tens. Insertion order is meaningless, so
+            # rank by the harvest-time strength score (how much the source pin
+            # actually moved the box) and spend the budget on the top of that
+            # list.
+            ranked = sorted(
+                (c for c in new_run_edges if len(c) == 2),
+                key=lambda c: -self._clause_score.get(frozenset(c), 0.0))
+            edges += ranked
             lits_lists += edges[:budget - len(lits_lists)]
         if not lits_lists:
             return []
@@ -483,7 +552,7 @@ class PhaseSATLayer:
                 lits.append(self._lit(name, int(locs[i]), s))
         return lits
 
-    def process_picked_domains(self, d, run_key):
+    def process_picked_domains(self, d, run_key, prune=True):
         """Duty (a) + (b) on a picked batch dict. Returns (keep_indices or
         None-if-nothing-pruned, num_pruned). Clamps implied phases in
         d's lower/upper bounds in place when the tensors are present."""
@@ -495,7 +564,7 @@ class PhaseSATLayer:
             # The batch belongs to a different BaB run than the stored run
             # clauses: flush them (persistent facts remain valid).
             self._flush_run(run_key)
-        if self.run_unsat and run_key is not None:
+        if self.run_unsat and run_key is not None and prune:
             # Mirror UNSAT certificate for this run: every domain of the
             # OR group is counterexample-free (see _mark_run_unsat).
             n = len(histories)
@@ -536,7 +605,15 @@ class PhaseSATLayer:
                 continue
             ok, implied = solver.propagate(assumptions=lits)
             if not ok:
-                pruned += 1
+                if prune:
+                    pruned += 1
+                    continue
+                # prune=False (multi-tree call sites): the domain is refuted,
+                # but emptying a batch there breaks MTS's tree restore
+                # (restore_best_domains -> _generate_tree asserts on an empty
+                # candidate set). Keep it and let the clamps below tighten it;
+                # BaB will reach the same conclusion from the bounds.
+                keep.append(i)
                 continue
             keep.append(i)
             if have_bounds and implied:

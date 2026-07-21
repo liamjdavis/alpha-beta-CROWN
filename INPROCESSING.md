@@ -192,12 +192,102 @@ yaml block `solver: phase_probing:` (CLI in parentheses):
 | `vivify_use_cuts` (`--phase_probing_vivify_use_cuts`) | auto | GCP-CROWN cuts in the vivification oracle: auto (net's current module = previous rebuild's pool; round 1 cut-less) / off (ablation) / pool (probe-scoped module rebuilt per round from pool + pending + fresh clauses — the closed loop) |
 | `vivify_bcp` (`--phase_probing_vivify_bcp`) | false | unit-propagate each (clause, prefix) pin set through the SAT layer before GPU: conflicts shorten at zero GPU cost, implied literals become extra pins (needs `sat_layer`) |
 | `sat_layer` (`--phase_probing_sat_layer`) | false | CPU clause DB (PySAT/CaDiCaL): pick_out-time domain filtering + phase clamping |
+| `wide_root` (`--phase_probing_wide_root`) | false | cross-layer batched root probe: clamp injected per batch ROW via a `clamp_interim_bounds` hook instead of through `interm_bounds`, so probes at any depth share one backward pass (see "Wide root probe" section). Makes full coverage affordable. |
+| `wide_root_window` (`--phase_probing_wide_root_window`) | -1 | with `wide_root`: a row keeps recomputed bounds only this many INTERMEDIATE layers past its own pin (-1 = unlimited, 0 = all-fixed weak oracle). 1 is the measured knee — cuts saturate at the first layer. |
+| `wide_root_interm_only` (`--phase_probing_wide_root_interm_only`) | false | with `wide_root`: skip the full-network output backward pass, compute ONLY the intermediate bounds the pass harvests (hull/edges/cuts). Drops the forced-phase channel; 10–15× faster on deep nets. |
+| `wide_root_sparse` (`--no_phase_probing_wide_root_sparse`) | true | with `wide_root`: recompute only neurons unstable at the root (root bounds as `aux_reference_bounds`); off = dense IBP-superset (3.4× slower, identical facts at window 1). |
+| `wide_root_time_budget_frac` (`--phase_probing_wide_root_time_budget_frac`) | 0.0 | cap wide-root probe wall clock at this fraction of the per-instance timeout (0 = uncapped); depth-sorted chunking stops adding chunks, so coverage degrades gracefully. |
 | `reprobe` (`--phase_probing_reprobe`) | false | conditioned re-probing at depth (see its section); needs `sat_layer` |
 | `reprobe_budget` (`--phase_probing_reprobe_budget`) | 15.0 | total wall-clock seconds of re-probing per instance |
 | `reprobe_max_neurons` (`--phase_probing_reprobe_max_neurons`) | 64 | top-N still-unstable neurons re-probed per pass |
 
 Env (measurement only): `PHASE_PROBING_GUROBI_MAX=N` caps gurobi-rung
 probes; `GRB_LICENSE_FILE` points at the Gurobi license (WLS works).
+
+## Wide root probe + interm-only: affordable FULL coverage (2026-07-20)
+
+The root probe used to issue one `compute_bounds` call per pinned layer, because
+`interm_bounds` is a per-CALL dict: a probe pinned at layer L needs L
+fixed-with-clamp and everything below it FREE (recomputed under the clamp — the
+source of hull refinement / implication edges / implied cuts), and probes at
+different depths cannot agree on that. Cost was superlinear (65 → 145 ms/neuron,
+64 → 256 neurons), so full coverage (`max_neurons 0`) blew every per-instance
+budget — the `probe_alpha_nall` graveyard entry.
+
+**Wide root** (`--phase_probing_wide_root`) stops expressing the clamp through
+`interm_bounds`. Every layer from the earliest pin on is left free, and the
+clamp is written into `node.lower/upper` for the owning rows by a hook on
+`clamp_interim_bounds` (which `BoundedModule` already calls at the end of
+`compute_intermediate_bounds`, both fresh and cached paths). Intermediate bounds
+compute in topological order, so a row's clamp lands before anything downstream
+of it is bounded — each row still gets full downstream recomputation under its
+own pin, and rows at different depths share one backward pass. Soundness is the
+same restriction the per-layer path makes (the clamp uses max/min not
+assignment, so a neuron the recomputation re-stabilised never crosses; freed
+layers are intersected back against the alpha-optimized root bounds).
+
+Three levers made cifar100 idx0 (1,447 neurons) go **153.2s → 8.85s (17×)**,
+per-probe now CHEAPER than the n=64 arm (2.6 vs 9.3 ms/row):
+1. `wide_root_sparse` (default on): `aux_reference_bounds` = root bounds, so a
+   freed layer recomputes only neurons unstable AT THE ROOT (BaB's own
+   assumption) instead of an IBP-guessed dense superset. ~85% of the win. NOT a
+   fact loss at window 1 — dense and sparse give identical edges/cuts there
+   (dense only refines root-stable neurons, which yield nothing).
+2. `wide_root_window 1`: keep recomputation for one intermediate layer past each
+   pin. Cuts saturate at the first layer; layers 2+ cost 15.5s for +61 edges and
+   +0 cuts. (Window is measured in INTERMEDIATE-layer positions, not raw graph
+   nodes.)
+3. Cross-layer batching itself: converts the superlinear per-layer scaling into
+   flat (111 → 106 ms/neuron, 64 → 1,447 neurons).
+
+**Interm-only** (`--phase_probing_wide_root_interm_only`): `compute_bounds` is
+`check_prior_bounds` (produces the freed-layer bounds behind hull/edges/cuts)
+followed by `backward_general` (the OUTPUT bound, which only yields forced
+phases). On tinyimagenet the output pass was ~97% of probe time and produced 2
+forced phases out of 1,925 neurons. Retargeting `final` at the deepest freed
+layer's consumer prunes everything downstream (`_set_used_nodes`), so the pass
+runs a short path with spec 1. Measured on tinyimagenet full coverage:
+
+| | control | interm-only |
+|---|---|---|
+| probe median | 30.19s | **2.38s** (12.7×) |
+| implication edges | 82 | 82 (identical) |
+| implied cuts | 12 | 12 (identical) |
+| forced phases | 2 | 0 (channel dropped) |
+
+⇒ **The shipped full-coverage arm has NO unit-derivation channel** — it is
+carried entirely by bound tightening and cuts. This is the key divergence from
+Marabou, whose arc was unit-dominated (+13/+26/+28). abcrown's root probe barely
+refutes phases (alpha-CROWN root bounds are already tight, so a single pin rarely
+closes one); hypothesis: CNN vs dense-network, untested.
+
+### Population A/B, 8 configs, treatment vs BICCOS baseline (cut-matched)
+
+`WIDE_ROOT=1 WIDE_WINDOW=1 PROBE_MAX_NEURONS=0 WIDE_INTERM_ONLY=1`, full
+mirror+SAT stack. **cut-matched** = both arms carry `--enable_cut
+--enable_bab_cut --biccos_cuts`, so the comparison isolates probing (vs the raw
+config-only baseline, which measures the cut machinery: raw→BICCOS is +1.84×
+time = the cuts, BICCOS→treatment only +1.12× = probing). net = solves gained;
+dom = domains-visited ratio.
+
+| config | net / time / dom vs BICCOS |
+|---|---|
+| cifar_cnn_a_adv | +1 / 0.90× / 0.63× |
+| cifar_cnn_a_mix | +2 / 0.87× / 0.70× |
+| cifar_cnn_b_adv | +2 / 0.93× / 0.54× |
+| mnist_cnn_a_adv | −1 / 0.97× / 0.96× |
+| tinyimagenet | +3 / 1.12× / 0.81× |
+| cifar10-resnet | 0 / 1.00× / 0.76× |
+| cifar100 | −3 / 1.08× / 0.69× |
+| oval_base | 0 / 0.96× / 0.58× |
+
+**Domains visited drop uniformly (0.54–0.81×): the facts prune the tree on
+every config** — the clean mechanistic result, invisible against the raw
+baseline. Small SDP-FO CNNs win outright (+1/+2 solves AND faster). The
+negatives are the two largest nets (cifar100, cifar10-resnet-adjacent) where
+per-node cut cost outweighs the pruning; the domain reduction is real there too
+(0.69×/0.76×) but does not convert. Full raw-baseline table and the SDP-FO "_4"
+variants are pending. All arms: 0 safe↔unsafe disagreements.
 
 ## Measured results (cifar100 vnncomp24 idx0, 64 neurons, batch 128)
 

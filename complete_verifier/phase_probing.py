@@ -97,6 +97,10 @@ from utils import expand_batch
 
 _RUNGS = ['crown', 'alpha', 'beta', 'gurobi']
 
+# Number of times the wide-root clamp hook actually wrote a clamp. Guards
+# the interm_bounds-fixed pin layers (see _make_clamp_hook).
+_CLAMPS_APPLIED = 0
+
 
 def _flatten_solver_vars(v, out):
     """Flatten (possibly nested lists of) gurobi vars into a flat list."""
@@ -113,6 +117,116 @@ def _is_oom(e):
     RuntimeError, so match on the message as well."""
     return isinstance(e, torch.cuda.OutOfMemoryError) or (
         isinstance(e, RuntimeError) and 'out of memory' in str(e).lower())
+
+
+def _chunk_too_big(e):
+    """Conditions a smaller probe chunk can fix: plain CUDA OOM, plus the
+    TorchScript fuser's 32-bit element-count assert
+    (`inputs[0].numel() <= std::numeric_limits<uint32_t>::max()`), which a
+    big chunk over a wide layer trips well before memory runs out.
+
+    _is_oom alone does NOT match the fuser assert, so the retry loop could
+    not back off from it and the run died outright -- this killed the
+    cifar100 full-coverage job at instance 109/200. Chunking only changes
+    how probes are grouped into batches, never which probes run or what they
+    prove, so backing off here is scientifically inert."""
+    return _is_oom(e) or (
+        isinstance(e, RuntimeError) and 'numeric_limits<uint32_t>' in str(e))
+
+
+def _clamp_index(clamps, device):
+    """Split [(row, nidx, sign), ...] into the four index tensors the clamp
+    hook needs: (rows_active, idx_active, rows_inactive, idx_inactive).
+    Returns None when there is nothing to clamp at this layer."""
+    if not clamps:
+        return None
+    out = []
+    for want in (True, False):
+        sel = [(r, n) for (r, n, s) in clamps if (s > 0) is want]
+        out.append(torch.tensor([r for r, _ in sel], dtype=torch.long,
+                                device=device))
+        out.append(torch.tensor([n for _, n in sel], dtype=torch.long,
+                                device=device))
+    return tuple(out)
+
+
+def _make_clamp_hook(node):
+    """Build the per-batch-row bound surgery for one node, called by
+    BoundedModule.compute_intermediate_bounds right after this node's
+    bounds are finalized and before node.interval is set.
+
+    Three jobs, in this order:
+      1. root intersection -- the layer is FREE in this pass, so plain CROWN
+         may recompute it looser than the root's alpha-optimized bounds.
+         Those root bounds hold on the whole input box, hence on every
+         pinned sub-region, so intersecting is sound and keeps the wide rung
+         at least as strong as the per-layer rung (which fed the root values
+         in through interm_bounds);
+      2. window write-back -- rows whose pin lies further upstream than the
+         depth window get the ROOT bounds restored outright, so their probe
+         stops paying for recomputation past the window;
+      3. clamp -- rows pinned AT this layer get lb=0 (active) or ub=0
+         (inactive) written in, which every downstream layer then sees.
+    A row is never both (2) and (3): its own pin sits at distance 0, inside
+    any window >= 0.
+    """
+    def hook(self=node):
+        lo, up = self.lower, self.upper
+        if lo is None or up is None:
+            return
+        B = lo.shape[0]
+        if B != self._probe_batch:
+            return  # not the probe batch (e.g. a batch-1 reference pass)
+        olb, oub = self._probe_orig
+        lo = torch.maximum(lo, olb)
+        up = torch.minimum(up, oub)
+        restore = self._probe_restore
+        if restore is not None:
+            view = restore.view(B, *([1] * (lo.dim() - 1)))
+            lo = torch.where(view, olb.expand_as(lo), lo)
+            up = torch.where(view, oub.expand_as(up), up)
+        clamps = self._probe_clamps
+        if clamps is not None:
+            if lo is self.lower:
+                lo, up = lo.clone(), up.clone()
+            flat_lo, flat_up = lo.view(B, -1), up.view(B, -1)
+            # clamp with max/min, not assignment: the pin layer is FREE
+            # here, so by the time the clamp lands its bounds have been
+            # recomputed and intersected with the root, and the neuron may
+            # no longer straddle zero. Assigning 0 would then CROSS the
+            # bounds (lb > ub) and feed a garbage relaxation downstream.
+            # Intersecting is the same restriction and degenerates to the
+            # assignment exactly when the neuron is still unstable, which is
+            # the only case the per-layer _pin_bounds ever sees.
+            # The far side is pulled along so the interval can never CROSS.
+            # If recomputation already decided the neuron the other way the
+            # pinned region is EMPTY; collapsing it to a degenerate point is
+            # a superset of empty, hence sound, and any output bound derived
+            # from it is vacuously valid.
+            # Counter, not decoration: pinned layers are now passed in
+            # interm_bounds and rely on clamp_interim_bounds firing on
+            # BoundedModule's already-current path. If that path ever stops
+            # calling the hook, every probe silently becomes a no-op and the
+            # run still "succeeds" with zero facts. _CLAMPS_APPLIED must be
+            # non-zero on any real probing pass.
+            global _CLAMPS_APPLIED
+            _CLAMPS_APPLIED += 1
+            r_act, i_act, r_inact, i_inact = clamps
+            if r_act.numel():
+                v = flat_lo[r_act, i_act].clamp(min=0.)
+                flat_lo[r_act, i_act] = v
+                flat_up[r_act, i_act] = flat_up[r_act, i_act].clamp(min=v)
+            if r_inact.numel():
+                v = flat_up[r_inact, i_inact].clamp(max=0.)
+                flat_up[r_inact, i_inact] = v
+                flat_lo[r_inact, i_inact] = flat_lo[r_inact, i_inact].clamp(
+                    max=v)
+        self.lower, self.upper = lo, up
+        # Keep node.linear in sync -- BoundedModule does the same after its
+        # own reference-bound tightening (see compute_intermediate_bounds).
+        if getattr(self, 'linear', None) is not None:
+            self.linear.lower, self.linear.upper = lo, up
+    return hook
 
 
 class _SpecChecker:
@@ -258,6 +372,21 @@ class _PhaseProber:
         # actually recomputed; probe_and_refine releases everything.
         self.alpha_interm_retained = bool(
             getattr(model, 'phase_probing_keep_alpha_nodes', None))
+        self.wide_root = bool(self.cfg.get('wide_root', False))
+        self.wide_root_window = int(self.cfg.get('wide_root_window', -1))
+        self.wide_root_sparse = bool(self.cfg.get('wide_root_sparse', True))
+        self.wide_root_interm_only = bool(
+            self.cfg.get('wide_root_interm_only', False))
+        # Window units: position within the topologically ordered INTERMEDIATE
+        # layers, not raw node_order. node_order enumerates every graph node
+        # (conv/add/relu/...), so a window of 2-3 nodes often fails to reach
+        # the next ReLU pre-activation at all -- measured: W=0 and W=1 were
+        # bit-identical (zero facts), as were W=2 and W=3. In layer units the
+        # dial is monotone and means what it says.
+        self.layer_pos = {
+            name: i for i, name in enumerate(
+                sorted(self.interm_names, key=lambda n: self.node_order[n]))
+        }
         self._gurobi = None  # cached (grb, model, flat out vars) or False
         self._margin_gains = []  # per-escalated-probe margin improvements
 
@@ -267,6 +396,10 @@ class _PhaseProber:
             'avg_tightening': 0.0, 'max_tightening': 0.0,
             'escalated': {r: 0 for r in _RUNGS[1:]},
             'implication_edges': 0, 'implied_cuts': 0, 'time': 0.0,
+            # wall clock per rung, so a slow pass can be attributed instead
+            # of guessed at (the crown/alpha split is the whole question at
+            # full coverage, where ~97% of probes escalate).
+            'rung_time': {},
         }
 
     # ------------------------------------------------------------------
@@ -371,18 +504,19 @@ class _PhaseProber:
             self.ref_ub[k] = torch.minimum(
                 self.ref_ub[k], hull_u.min(dim=0, keepdim=True).values)
             if k in self.unstable_mask:
-                self._collect_edges_and_cuts(layer_name, pairs, k, dl, du,
-                                             width)
+                self._collect_edges_and_cuts(
+                    [(layer_name, n) for n in pairs], k, dl, du, width)
         for p, nidx in enumerate(pairs):
             key = (layer_name, nidx)
             self.pair_gain[key] = max(self.pair_gain.get(key, 0.),
                                       float(gain[p]))
 
-    def _collect_edges_and_cuts(self, pin_layer, pairs, k, dl, du, width):
+    def _collect_edges_and_cuts(self, pair_keys, k, dl, du, width):
         """dl/du: [npairs, 2, ...] downstream bounds of layer k under the
-        probes of pin_layer (dim 1: 0=active, 1=inactive). Restricted to
-        the ORIGINALLY unstable neurons of layer k."""
-        npairs = len(pairs)
+        probes of pair_keys (a list of (pin_layer, pin_idx), dim 1 of
+        dl/du: 0=active, 1=inactive). Restricted to the ORIGINALLY unstable
+        neurons of layer k. pair_keys may mix pin layers (wide root rung)."""
+        npairs = len(pair_keys)
         um = self.unstable_mask[k]
         if not bool(um.any()):
             return
@@ -396,7 +530,7 @@ class _PhaseProber:
                 for cond, tgt_sign in (((fl[:, side, :] >= 0), +1),
                                        ((fu[:, side, :] <= 0), -1)):
                     for p, j in cond.nonzero().tolist():
-                        src = (pin_layer, pairs[p], sign)
+                        src = (*pair_keys[p], sign)
                         self.implications.setdefault(src, set()).add(
                             (k, int(uidx[j]), tgt_sign))
                         self._num_edges += 1
@@ -410,7 +544,7 @@ class _PhaseProber:
             b_act, b_inact = arr[:, 0, :], arr[:, 1, :]
             gapf = (b_act - b_inact).abs() / w
             for p, j in (gapf >= gap_frac).nonzero().tolist():
-                key = (pin_layer, pairs[p], k, int(uidx[j]), kind)
+                key = (*pair_keys[p], k, int(uidx[j]), kind)
                 rec = (float(gapf[p, j]), float(b_inact[p, j]),
                        float(b_act[p, j]))
                 old = self.cut_cands.get(key)
@@ -442,9 +576,31 @@ class _PhaseProber:
     # Rung: crown / alpha (batched pairs, downstream recomputation)
     # ------------------------------------------------------------------
 
+    def _time_rung(self, rung, wide=False):
+        """Context manager accumulating wall clock into stats['rung_time'].
+        Distinguishes the wide and per-layer paths so a run that probes wide
+        at crown and escalates per-layer at alpha is attributable."""
+        key = f'{rung}{"-wide" if wide else ""}'
+        stats = self.stats
+
+        class _T:
+            def __enter__(_s):
+                _s.t0 = time.time()
+                return _s
+
+            def __exit__(_s, *exc):
+                stats['rung_time'][key] = (
+                    stats['rung_time'].get(key, 0.) + time.time() - _s.t0)
+                return False
+        return _T()
+
     def run_pair_rung(self, rung, pairs_by_layer):
         """Run all probes of `rung` ('crown' or 'alpha') over
         pairs_by_layer: {layer_name: [nidx, ...]}. Updates probe_state."""
+        with self._time_rung(rung):
+            self._run_pair_rung(rung, pairs_by_layer)
+
+    def _run_pair_rung(self, rung, pairs_by_layer):
         sel = self.sel if rung == 'alpha' else None
         pairs_per_chunk = max(1, max(2, self.cfg['batch_size']) // 2)
         for layer_name in sorted(pairs_by_layer,
@@ -466,30 +622,390 @@ class _PhaseProber:
                     print(f'Phase probing: CUDA OOM, reducing probe chunk to '
                           f'{2 * cur} probes.')
                     continue
-                scores = self.checker.score(lb_out, sel)
-                for j, nidx in enumerate(chunk):
-                    for off, sign in ((0, +1), (1, -1)):
-                        s = float(scores[2 * j + off])
-                        key = (layer_name, nidx, sign)
-                        st = self.probe_state.setdefault(
-                            key, {'score': float('-inf'), 'verified': False,
-                                  'rung': rung})
-                        if rung != 'crown' and st['score'] > float('-inf'):
-                            # track how much the stronger oracle moved the
-                            # probe's output margin (reporting only)
-                            self._margin_gains.append(
-                                max(0., s - st['score']))
-                        st['score'] = max(st['score'], s)
-                        st['verified'] |= s > 0
-                        st['rung'] = rung
-                    if self.probe_state[(layer_name, nidx, +1)]['verified'] \
-                            and self.probe_state[(layer_name, nidx, -1)]['verified']:
-                        self.both_verified = (layer_name, nidx)
+                self._record_scores([(layer_name, n) for n in chunk],
+                                    self.checker.score(lb_out, sel), rung)
                 pos += len(chunk)
-                if rung == 'crown':
-                    self.stats['probed_neurons'] += len(chunk)
                 if self.both_verified is not None:
                     return
+
+    def _record_scores(self, pair_keys, scores, rung):
+        """Fold one chunk's output-margin scores into probe_state.
+        pair_keys: list of (layer, nidx), one per PAIR; scores: [2*npairs]
+        laid out active at 2j, inactive at 2j+1."""
+        for j, (layer_name, nidx) in enumerate(pair_keys):
+            for off, sign in ((0, +1), (1, -1)):
+                s = float(scores[2 * j + off])
+                key = (layer_name, nidx, sign)
+                st = self.probe_state.setdefault(
+                    key, {'score': float('-inf'), 'verified': False,
+                          'rung': rung})
+                if rung != 'crown' and st['score'] > float('-inf'):
+                    # track how much the stronger oracle moved the probe's
+                    # output margin (reporting only)
+                    self._margin_gains.append(max(0., s - st['score']))
+                st['score'] = max(st['score'], s)
+                st['verified'] |= s > 0
+                st['rung'] = rung
+            if self.probe_state[(layer_name, nidx, +1)]['verified'] \
+                    and self.probe_state[(layer_name, nidx, -1)]['verified']:
+                self.both_verified = (layer_name, nidx)
+        if rung == 'crown':
+            self.stats['probed_neurons'] += len(pair_keys)
+
+    # ------------------------------------------------------------------
+    # Rung: wide crown (cross-layer batch, per-row clamp hook)
+    # ------------------------------------------------------------------
+    #
+    # The per-layer rung above is forced to issue one compute_bounds call
+    # per pinned layer because interm_bounds is a PER-CALL dict: a layer is
+    # either fixed for the whole batch or free for the whole batch, and a
+    # probe pinned at layer L needs L fixed-with-clamp while everything
+    # below L is free. Two probes at different depths cannot agree on that.
+    #
+    # The wide rung sidesteps it by not expressing the clamp through
+    # interm_bounds at all. Every layer from the earliest pin onward is left
+    # FREE, and the clamp is written into node.lower/node.upper for the
+    # owning rows by a hook on clamp_interim_bounds, which BoundedModule
+    # calls at the end of compute_intermediate_bounds (bound_general.py, in
+    # both the freshly-computed and the cached-bounds paths) just before
+    # node.interval is set. Because intermediate bounds are computed in
+    # topological order, a row's clamp is installed before anything
+    # downstream of it is bounded, so each row still gets full downstream
+    # recomputation under its own pin -- the strong oracle -- while rows
+    # pinned at different depths share a single backward pass.
+    #
+    # Soundness is the same restriction the per-layer rung makes, applied at
+    # a later point in the same computation: setting lb=0 (resp. ub=0) for
+    # one row narrows that row's region to the pinned phase, and rows never
+    # interact because every downstream op is batch-elementwise.
+    #
+    # The same hook implements the depth window: for a row whose pin is more
+    # than `wide_root_window` positions upstream of the current node, the
+    # ROOT bounds are written back for that row, capping per-probe cost at
+    # the window size instead of the whole remaining network. Writing back a
+    # bound that is valid on the entire input box is always sound; it only
+    # gives up tightness.
+
+    def _install_clamp_hooks(self, rows_at, row_pin_order, B, window, min_pin):
+        """Patch clamp_interim_bounds on every layer that needs per-row
+        surgery and register it in layers_with_constraint so BoundedModule
+        actually calls it. Returns an undo callable."""
+        net = self.net
+        prev_constraint = list(net.layers_with_constraint)
+        patched = []
+        for k in self.interm_names:
+            ko = self.layer_pos[k]
+            if ko < min_pin:
+                continue  # fixed via interm_bounds; never recomputed
+            clamps = rows_at.get(k)
+            restore = None
+            if window >= 0:
+                m = (row_pin_order + window) < ko
+                if bool(m.any()):
+                    restore = m
+            # Every freed layer is hooked, not just the pinned ones: the
+            # root-bound intersection in the hook is what keeps a freed
+            # layer from being recomputed LOOSER than the root value that
+            # the per-layer rung would have fed in through interm_bounds.
+            node = net[k]
+            # Pre-split into (rows, indices) index tensors per phase so the
+            # hook does two vectorized index_puts instead of one GPU sync
+            # per clamped neuron (thousands, at full coverage).
+            node._probe_clamps = _clamp_index(clamps, self.device)
+            node._probe_restore = restore
+            node._probe_orig = (self.orig_lb[k], self.orig_ub[k])
+            node._probe_batch = B
+            node.clamp_interim_bounds = _make_clamp_hook(node)
+            patched.append(node)
+            if k not in net.layers_with_constraint:
+                net.layers_with_constraint.append(k)
+
+        def undo():
+            net.layers_with_constraint = prev_constraint
+            for n in patched:
+                # the patch is an INSTANCE attribute shadowing the class
+                # method; deleting it restores the original no-op.
+                n.__dict__.pop('clamp_interim_bounds', None)
+                for a in ('_probe_clamps', '_probe_restore', '_probe_orig',
+                          '_probe_batch'):
+                    n.__dict__.pop(a, None)
+        return undo
+
+    def _run_wide_chunk(self, pairs, rung):
+        """One cross-layer probe chunk. pairs: list of (layer_name, nidx);
+        row 2j pins pair j ACTIVE, row 2j+1 pins it INACTIVE. Returns
+        [B, k] output lower bounds and folds the downstream hull."""
+        npairs = len(pairs)
+        B = 2 * npairs
+        window = self.wide_root_window
+        # Depths are LAYER positions (index into the topologically sorted
+        # intermediate layers), so a window of 1 means exactly one
+        # intermediate layer past the pin. See layer_pos in __init__.
+        pin_order = torch.tensor([self.layer_pos[ln] for ln, _ in pairs],
+                                 device=self.device)
+        min_pin = int(pin_order.min())
+        max_pin = int(pin_order.max())
+        row_pin_order = pin_order.repeat_interleave(2)
+
+        # Only the band [min_pin, max_pin + window] is freed and recomputed
+        # under the hooks; everything outside it is fixed at the root values
+        # through interm_bounds:
+        #   * strictly upstream of the EARLIEST pin -- no clamp in this chunk
+        #     can affect it;
+        #   * beyond the LATEST pin plus the window -- outside every row's
+        #     window, so the hook would only overwrite it with the root
+        #     values anyway. Fixing it here means it is never computed at
+        #     all, which is where the window's cost saving actually comes
+        #     from. Sorting the chunk by depth keeps this band narrow.
+        far = (max_pin + window) if window >= 0 else None
+        # The PINNED layers are fixed at their root values too, not freed.
+        # Recomputing a pinned layer is pure waste: the hook clamps it and
+        # intersects it back against the root immediately afterwards, so
+        # CROWN can only ever return something looser than what we overwrite
+        # it with. It is also the dominant cost -- measured on tinyimagenet,
+        # a pins=[0,0] chunk freed 2 layers totalling 1390 unstable neurons,
+        # most of them the pin layer's own. Fixing it here still delivers the
+        # clamp: BoundedModule calls clamp_interim_bounds on the
+        # already-current path too (bound_general.py, the
+        # is_lower_bound_current early return), which is where a layer passed
+        # in interm_bounds lands.
+        pinned_names = {ln for ln, _ in pairs}
+        probe_ib = {}
+        for k in self.interm_names:
+            ko = self.layer_pos[k]
+            if k in pinned_names or ko < min_pin \
+                    or (far is not None and ko > far):
+                probe_ib[k] = [
+                    self.orig_lb[k].expand(B, *self.orig_lb[k].shape[1:]),
+                    self.orig_ub[k].expand(B, *self.orig_ub[k].shape[1:]),
+                ]
+
+        rows_at = {}
+        for j, (ln, nidx) in enumerate(pairs):
+            rows_at.setdefault(ln, []).append((2 * j, nidx, +1))
+            rows_at[ln].append((2 * j + 1, nidx, -1))
+
+        # Cost anatomy (PHASE_PROBING_CHUNK_DIAG=1). The hypothesis under test
+        # is that wide-root cost is QUADRATIC in the unstable count: a freed
+        # layer's bounds are computed by a backward pass whose spec dimension
+        # is that layer's OWN unstable count, so per chunk the work is
+        # B x unstable_freed, and with total/P chunks the total is
+        # 2 x total_unstable x unstable_freed. If that holds, no amount of
+        # chunk/window/sparsity tuning fixes tinyimagenet -- only removing the
+        # per-freed-layer backward pass does.
+        diag = os.environ.get('PHASE_PROBING_CHUNK_DIAG') == '1'
+        if diag:
+            freed = [k for k in self.interm_names if k not in probe_ib]
+            n_unstable_freed = sum(
+                int(self.unstable_mask[k].sum()) for k in freed
+                if k in self.unstable_mask)
+            torch.cuda.synchronize()
+            t_chunk = time.time()
+
+        undo = self._install_clamp_hooks(rows_at, row_pin_order, B, window,
+                                         min_pin)
+        try:
+            sel = self.sel if rung == 'alpha' else None
+            new_x, C = self._probe_x_c(B, sel)
+            # Sparse intermediate bounds: without aux_reference_bounds
+            # auto_LiRPA falls back to IBP to decide which neurons of a freed
+            # layer are unstable (get_ref_intermediate_bounds), and IBP is far
+            # looser than the root's alpha-CROWN bounds -- so it computes a
+            # dense superset. Handing it the ROOT bounds restricts the
+            # recomputation to neurons that are actually unstable there, which
+            # is the same assumption BaB makes; a neuron stable at the root
+            # stays stable under a clamp, since the hook intersects every
+            # freed layer back against the root anyway.
+            # Measured on cifar100 idx0 at full coverage: 153.2s -> 23.4s, but
+            # NOT a pure speedup -- neurons stable at the root stop being
+            # recomputed, so their refinement is lost (edges 502 -> 130) and
+            # the looser probe bounds collapse the escalation set (2816 -> 4).
+            # Toggle so cost and fact loss can be separated.
+            aux_ref = {k: [self.orig_lb[k].expand(B, *self.orig_lb[k].shape[1:]),
+                           self.orig_ub[k].expand(B, *self.orig_ub[k].shape[1:])]
+                       for k in self.interm_names
+                       if k not in probe_ib} if self.wide_root_sparse else None
+            with torch.no_grad():
+                if self.wide_root_interm_only:
+                    # INTERMEDIATE-ONLY. compute_bounds is
+                    #     check_prior_bounds(final, C)   <- computes the freed
+                    #                                       layer's bounds
+                    #     backward_general(final, C)     <- full-network output
+                    #                                       pass
+                    # and only the first produces what window=1 harvests (hull
+                    # refinement, implication edges, implied cuts). Measured on
+                    # tinyimagenet: the output pass costs ~0.82s per B=128
+                    # chunk -- essentially the entire 28.7s -- and buys 2
+                    # forced phases out of 1925 probed neurons.
+                    # Retargeting `final` at the deepest freed layer's consumer
+                    # makes _set_used_nodes prune everything downstream, so the
+                    # backward pass runs over a short path with a spec of 1
+                    # instead of the whole network with the full spec.
+                    # No output bound => no probe scores, no forced phases, no
+                    # escalation; the hull/edge/cut channel is unaffected.
+                    lb_out = None
+                    deepest = max((k for k in self.interm_names
+                                   if k not in probe_ib),
+                                  key=lambda k: self.layer_pos[k], default=None)
+                    if deepest is not None:
+                        tgt = self.net[deepest].output_name[0]
+                        shape = self.net[tgt].output_shape[1:]
+                        dummy_c = torch.zeros(B, 1, *shape, device=self.device)
+                        self.net.compute_bounds(
+                            x=(new_x,), C=dummy_c, method='backward',
+                            final_node_name=tgt,
+                            interm_bounds=probe_ib, bound_upper=False,
+                            aux_reference_bounds=aux_ref)
+                        self._fold_wide(pairs, pin_order, B, window)
+                else:
+                    lb_out = self.net.compute_bounds(
+                        x=(new_x,), C=C, method='backward',
+                        reuse_alpha=(rung == 'alpha'),
+                        interm_bounds=probe_ib, bound_upper=False,
+                        aux_reference_bounds=aux_ref)[0]
+                    self._fold_wide(pairs, pin_order, B, window)
+        finally:
+            undo()
+        if diag:
+            torch.cuda.synchronize()
+            dt = time.time() - t_chunk
+            work = B * max(1, n_unstable_freed)
+            print(f'CHUNKDIAG B={B} pins=[{min_pin},{max_pin}] '
+                  f'freed={len(freed)} unstable_freed={n_unstable_freed} '
+                  f'work={work} t={dt:.4f}s us_per_work={1e6 * dt / work:.4f} '
+                  f'clamps={_CLAMPS_APPLIED}')
+        return lb_out
+
+    def _fold_wide(self, pairs, pin_order, B, window):
+        """Hull fold for a cross-layer chunk. A pair only contributes at
+        layer k when k is genuinely downstream of THAT pair's pin and inside
+        its window -- otherwise the row carries no clamp at k (or was
+        written back to root) and there is nothing to learn from it."""
+        npairs = len(pairs)
+        gain = torch.zeros(npairs, device=self.device)
+        for k in self.interm_names:
+            ko = self.layer_pos[k]
+            act = pin_order < ko
+            if window >= 0:
+                act = act & ((pin_order + window) >= ko)
+            if not bool(act.any()):
+                continue
+            node = self.net[k]
+            dl, du = node.lower, node.upper
+            if dl is None or du is None or dl.shape[0] != B \
+                    or dl.shape[1:] != self.orig_lb[k].shape[1:]:
+                continue  # not recomputed in this pass
+            idx = act.nonzero().reshape(-1)
+            dl = dl.detach().view(npairs, 2, *dl.shape[1:])[idx]
+            du = du.detach().view(npairs, 2, *du.shape[1:])[idx]
+            hull_l = dl.min(dim=1).values
+            hull_u = du.max(dim=1).values
+            width = (self.orig_ub[k] - self.orig_lb[k]).clamp(min=1e-12)
+            red = ((hull_l - self.orig_lb[k]).clamp(min=0)
+                   + (self.orig_ub[k] - hull_u).clamp(min=0)) / width
+            gain[idx] = torch.maximum(
+                gain[idx], red.view(idx.numel(), -1).max(dim=1).values)
+            self.ref_lb[k] = torch.maximum(
+                self.ref_lb[k], hull_l.max(dim=0, keepdim=True).values)
+            self.ref_ub[k] = torch.minimum(
+                self.ref_ub[k], hull_u.min(dim=0, keepdim=True).values)
+            if k in self.unstable_mask:
+                self._collect_edges_and_cuts(
+                    [pairs[i] for i in idx.tolist()], k, dl, du, width)
+        for p, key in enumerate(pairs):
+            self.pair_gain[key] = max(self.pair_gain.get(key, 0.),
+                                      float(gain[p]))
+
+    def run_wide_rung(self, rung, candidates):
+        """Cross-layer replacement for run_pair_rung. candidates: list of
+        (layer, nidx, score)."""
+        with self._time_rung(rung, wide=True):
+            self._run_wide_rung(rung, candidates)
+
+    def _run_wide_rung(self, rung, candidates):
+        pairs_all, seen = [], set()
+        for (name, nidx, _) in candidates:
+            if (name, nidx) in seen:
+                continue
+            seen.add((name, nidx))
+            pairs_all.append((name, nidx))
+        # Topological order, so a chunk spans a contiguous depth range and
+        # the freed-layer set (everything from the chunk's earliest pin on)
+        # stays as small as possible.
+        pairs_all.sort(key=lambda t: (self.node_order[t[0]], t[1]))
+        # Adaptive probe budget. Full coverage is affordable in absolute terms
+        # but NOT relative to every config's per-instance timeout: measured on
+        # tinyimagenet (100s budget), the probe ran to a 30.2s median / 77.0s
+        # max and turned 16 safe instances into unknown for zero gains
+        # (-16 solved, 1.479x time), while cheap-probe configs gained. Capping
+        # probe wall clock at a fraction of the instance timeout degrades
+        # COVERAGE gracefully instead of eating the search's budget.
+        # Truncating is legitimate here precisely because chunks are
+        # depth-sorted and every chunk is self-contained: stopping early
+        # yields a smaller but still valid probe set. (On the per-layer path
+        # the same truncation would bias coverage toward the earliest layers.)
+        budget = None
+        frac = float(self.cfg.get('time_budget_frac', 0.) or 0.)
+        if frac > 0:
+            timeout = float(arguments.Config['bab']['timeout'])
+            budget = frac * timeout
+        t_start = time.time()
+        per_chunk = max(1, max(2, self.cfg['batch_size']) // 2)
+        pos, cur = 0, per_chunk
+        sel = self.sel if rung == 'alpha' else None
+        n_layers = len({ln for ln, _ in pairs_all})
+        print(f'Phase probing: wide root rung over {len(pairs_all)} neurons '
+              f'across {n_layers} layers '
+              f'(window={self.wide_root_window}, chunk={2 * per_chunk}).')
+        torch.cuda.empty_cache()
+        # Cap how many layer positions one chunk may span. The freed band is
+        # [min_pin, max_pin + window], so a chunk straddling distant layers
+        # frees everything between them: measured on tinyimagenet, one
+        # pins=[0,9] chunk freed 10 layers / 1925 unstable neurons, costing
+        # what ~10 well-formed chunks cost. Allowing a span of 1 still lets
+        # thin adjacent layers share a batch (the point of the wide rung)
+        # without ever opening a wide band.
+        max_span = 1
+        while pos < len(pairs_all):
+            if budget is not None and time.time() - t_start > budget:
+                # Always report what was dropped: a silently truncated pass
+                # reads as "full coverage found nothing" in the summary.
+                self.stats['coverage_truncated'] = len(pairs_all) - pos
+                print(f'Phase probing: probe budget {budget:.1f}s exhausted, '
+                      f'stopping at {pos}/{len(pairs_all)} neurons '
+                      f'({100. * pos / len(pairs_all):.0f}% coverage).')
+                break
+            chunk = pairs_all[pos:pos + cur]
+            # Truncate the chunk at the first pair that would widen the band
+            # past max_span (pairs_all is depth-sorted, so this is a prefix).
+            base = self.layer_pos[chunk[0][0]]
+            for m, (ln, _) in enumerate(chunk):
+                if self.layer_pos[ln] - base > max_span:
+                    chunk = chunk[:m]
+                    break
+            try:
+                lb_out = self._run_wide_chunk(chunk, rung)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if not _chunk_too_big(e):
+                    raise
+                torch.cuda.empty_cache()
+                if cur == 1:
+                    raise
+                cur = max(1, cur // 2)
+                print(f'Phase probing: chunk too large ({type(e).__name__}), '
+                      f'reducing wide probe chunk to {2 * cur} probes.')
+                continue
+            if lb_out is not None:
+                self._record_scores(chunk, self.checker.score(lb_out, sel), rung)
+            elif rung == 'crown':
+                # interm-only skips _record_scores (no output bound to score),
+                # which is where probed_neurons is normally counted. Count it
+                # here or the summary reports probed=0 on a pass that probed
+                # everything.
+                self.stats['probed_neurons'] += len(chunk)
+            pos += len(chunk)
+            if self.both_verified is not None:
+                return
 
     # ------------------------------------------------------------------
     # Rung: beta (one-split domains, output bound only)
@@ -845,10 +1361,18 @@ class _PhaseProber:
         escalates near-misses up to cfg['oracle']."""
         max_rung = _RUNGS.index(self.cfg['oracle'])
 
-        pairs_by_layer = {}
-        for (name, idx, _) in candidates:
-            pairs_by_layer.setdefault(name, []).append(idx)
-        self.run_pair_rung('crown', pairs_by_layer)
+        if self.wide_root:
+            # Same strong crown oracle, one cross-layer batch instead of one
+            # call per pinned layer. Escalation below stays on the per-layer
+            # path: the escalation set is small, so the batching win there is
+            # negligible and the alpha rung's retained-alpha bookkeeping is
+            # tied to run_pair_rung.
+            self.run_wide_rung('crown', candidates)
+        else:
+            pairs_by_layer = {}
+            for (name, idx, _) in candidates:
+                pairs_by_layer.setdefault(name, []).append(idx)
+            self.run_pair_rung('crown', pairs_by_layer)
         if self.both_verified is not None or max_rung < 1:
             return
         ref_crown = self._full_box_score('crown')
@@ -876,7 +1400,18 @@ class _PhaseProber:
                           f'({len(seen)} pairs) to rung alpha (full-box '
                           f'score crown={ref_crown:.4f}, '
                           f'alpha={ref_alpha:.4f}).')
-                    self.run_pair_rung('alpha', alpha_pairs)
+                    if self.wide_root:
+                        # At full coverage ~97% of probes clear the
+                        # escalation threshold, so leaving this on the
+                        # per-layer path would run the superlinear rung over
+                        # nearly everything -- exactly what the wide crown
+                        # rung exists to avoid. Same candidate set, wide
+                        # batching.
+                        self.run_wide_rung('alpha', [
+                            (ln, nidx, 0.) for ln, idxs in alpha_pairs.items()
+                            for nidx in idxs])
+                    else:
+                        self.run_pair_rung('alpha', alpha_pairs)
                 except (torch.cuda.OutOfMemoryError, RuntimeError,
                         KeyError) as e:
                     # KeyError: an intermediate-start-node alpha needed for
@@ -1104,6 +1639,11 @@ class ClauseVivifier:
         self.device = model.device
         self.final_name = model.final_name
         self.x = prober.x
+        # Needed by _harvest_reprobe_edges (unstable masks, layer order,
+        # preact->relu index map) -- the same structures the root pass's
+        # _collect_edges_and_cuts reads.
+        self.prober = prober
+        self.reprobe_wide = cfg.get('reprobe_wide', False)
         self.grade = cfg['vivify_grade']
         self.max_lits = cfg['vivify_max_lits']
         self.budget = cfg['vivify_budget']
@@ -1384,6 +1924,134 @@ class ClauseVivifier:
         finally:
             undo()
 
+    def _harvest_reprobe_edges(self, chunk_keys, verified, sat_layer, run_key):
+        """Harvest binary implications from a re-probe chunk.
+
+        Marabou harvests binaries in BOTH its root probe and its re-probe, and
+        on its calibration instances the binaries are the bulk of the payload
+        (3_4 root: 3 units vs 141 binaries; re-probe: 10 vs 14). abcrown had
+        the whole implication-graph machinery -- the root probe collects edges
+        (_collect_edges_and_cuts) and the SAT layer stores them as (-src OR
+        tgt) clauses that the mirror propagates over -- but re-probe only ever
+        called add_run_unit, so it contributed nothing to the graph. Isolated
+        units just clamp one neuron each; edges are what the boolean layer can
+        actually propagate over.
+
+        A pin that was NOT refuted (verified == False) leaves the net's
+        downstream nodes holding the bounds computed under it, exactly as
+        _fold_downstream reads them. Any originally-unstable neuron that is
+        stable under the pin gives the edge (pin => that phase). Same detector
+        and same encoding as the root pass; RUN-scoped because the pin set also
+        carries this run's forced phases.
+
+        Returns the number of new edges installed.
+        """
+        added = 0
+        # Inverse of prober.relu_idx_of_preact (pre-act name -> relu index),
+        # built once: pair_gain is keyed by (pre-act name, neuron).
+        if not hasattr(self, '_preact_of_ridx'):
+            self._preact_of_ridx = {
+                ridx: name
+                for name, ridx in self.prober.relu_idx_of_preact.items()}
+        for k in self.prober.interm_names:
+            if k not in self.prober.unstable_mask:
+                continue
+            um = self.prober.unstable_mask[k]
+            if not bool(um.any()):
+                continue
+            node = self.net[k]
+            dl, du = node.lower, node.upper
+            if dl is None or du is None or dl.shape[0] != len(chunk_keys):
+                continue  # not recomputed for this chunk
+            tgt_ridx = self.prober.relu_idx_of_preact.get(k)
+            if tgt_ridx is None:
+                continue
+            fl = dl.detach().reshape(len(chunk_keys), -1)[:, um]
+            fu = du.detach().reshape(len(chunk_keys), -1)[:, um]
+            uidx = um.nonzero().reshape(-1)
+            for cond, tgt_sign in ((fl >= 0, +1), (fu <= 0, -1)):
+                for pidx, j in cond.nonzero().tolist():
+                    if verified[pidx]:
+                        continue  # refuted pin -> it is a unit, not an edge
+                    sridx, snidx, ssign = chunk_keys[pidx]
+                    if sridx == tgt_ridx and snidx == int(uidx[j]):
+                        continue  # a pin implying itself carries no news
+                    # Strength = how much the SOURCE pin actually moved the
+                    # box at root (pair_gain, the same measured quantity that
+                    # ranks re-probe candidates). The cut budget is tens while
+                    # a pass harvests thousands, so this decides which edges
+                    # reach the cutter at all.
+                    src_name = self._preact_of_ridx.get(sridx)
+                    score = self.prober.pair_gain.get((src_name, snidx), 0.0) \
+                        if src_name is not None else 0.0
+                    if sat_layer.add_run_edge(sridx, snidx, ssign, tgt_ridx,
+                                              int(uidx[j]), tgt_sign, run_key,
+                                              score=score):
+                        added += 1
+        return added
+
+    def _clamp_forced_phase(self, ridx, nidx, sign):
+        """Clamp a proven phase into the STATIC intermediate-bound templates
+        so it reaches BaB's branching mask.
+
+        sign > 0 means the neuron is forced ACTIVE (pre-activation >= 0), so
+        its lower bound clamps to 0; sign < 0 forces INACTIVE (<= 0), so the
+        upper bound clamps to 0. Either way the neuron stops being unstable
+        and compute_unstable_mask drops it from the split candidates.
+
+        Only ever TIGHTENS (torch.clamp toward 0 from the feasible side), and
+        only for a fact this run already proved entailed, so it cannot admit
+        behaviour the query does not have. Returns 1 if a bound moved.
+
+        Requires the static-template path (bab interm_transfer off, the
+        setting our configs use). With per-domain transfer the templates are
+        not the source of truth, so this no-ops rather than clamp something
+        that will be overwritten.
+        """
+        # domain_interm_factory lives on the LiRPANet WRAPPER (self.model,
+        # beta_CROWN_solver.py), not on the BoundedModule (self.net = model.net)
+        # -- reading it off self.net silently returned None and the clamp never
+        # fired. Fall back to net for any caller that passes the wrapper as net.
+        net = self.net
+        factory = getattr(self.model, 'domain_interm_factory', None) \
+            or getattr(net, 'domain_interm_factory', None)
+        if factory is None:
+            return 0
+        static_lb = getattr(factory, 'static_lb', None)
+        static_ub = getattr(factory, 'static_ub', None)
+        if not static_lb or not static_ub:
+            return 0
+        relus = getattr(net, 'relus', [])
+        if ridx >= len(relus):
+            return 0
+        name = relus[ridx].inputs[0].name
+        if name not in static_lb or name not in static_ub:
+            return 0
+        try:
+            lo = static_lb[name].view(static_lb[name].shape[0], -1)
+            hi = static_ub[name].view(static_ub[name].shape[0], -1)
+            if nidx >= lo.shape[1]:
+                return 0
+            moved = 0
+            if sign > 0:
+                cur = lo[:, nidx]
+                if bool((cur < 0).any()):
+                    lo[:, nidx] = torch.clamp(cur, min=0.)
+                    moved = 1
+            else:
+                cur = hi[:, nidx]
+                if bool((cur > 0).any()):
+                    hi[:, nidx] = torch.clamp(cur, max=0.)
+                    moved = 1
+            # Never leave an empty box: if the clamp crossed the other bound
+            # the region is infeasible, which BaB will detect on its own; keep
+            # the tensors consistent rather than inverted.
+            if moved and bool((lo[:, nidx] > hi[:, nidx]).any()):
+                lo[:, nidx] = torch.minimum(lo[:, nidx], hi[:, nidx])
+            return moved
+        except Exception:
+            return 0
+
     def reprobe(self, sat_layer, run_key, pool_cuts=None):
         """Conditioned re-probing at depth (ported from Marabou).
 
@@ -1441,10 +2109,45 @@ class ClauseVivifier:
         # box + cuts). Cheap proxy; selection is budget allocation, never
         # soundness -- a skipped probe loses a fact, it cannot produce a
         # wrong one.
+        # WIDE mode (--phase_probing_reprobe_wide): draw candidates from EVERY
+        # still-unstable neuron, not just the ones the root probe happened to
+        # examine. pair_gain only ever holds the root pass's top-N (64 by
+        # default) out of ~1,445 unstable on cifar100 -- a 4.4% slice -- so it,
+        # not the neuron cap, is what really bounds coverage. Marabou's
+        # skeleton is exhaustive by construction (100% of unfixed ReLUs) and
+        # that is the one structural difference with this port we never closed;
+        # every delivery channel we measured came back at exactly 1.000x, which
+        # is equally consistent with "facts are worthless" and with "4% of the
+        # neurons cannot move a search over the other 96%".
+        #
+        # Affordable because this path fixes ALL intermediate bounds
+        # (_pinned_interm_bounds) and pins per BATCH ROW, so probes from
+        # different layers share one backward pass. The root pass cannot do
+        # that: it OMITS downstream layers to recompute them under the clamp,
+        # and which layers are omitted depends on the pin's depth, so it must
+        # group by layer and pays a full pass per group (65 -> 145 ms/neuron
+        # measured from n=64 to n=256). The trade is that we lose downstream
+        # recomputation: no hull refinement, no downstream-derived implication
+        # edges, and a weaker refutation test. Hull tightening measures 0.002
+        # avg and the edges measured inert, so the trade is cheap.
         cands = []
-        for (ridx, nidx), gain in self.pair_gain.items():
-            if (ridx, nidx) not in decided_keys:
-                cands.append((gain, ridx, nidx))
+        if self.reprobe_wide:
+            for name in self.prober.relu_preacts:
+                um = self.prober.unstable_mask.get(name)
+                ridx = self.prober.relu_idx_of_preact.get(name)
+                if um is None or ridx is None or not bool(um.any()):
+                    continue
+                for nidx in um.nonzero().reshape(-1).tolist():
+                    if (ridx, nidx) in decided_keys:
+                        continue
+                    # Rank by root hull gain when known, else 0: unexamined
+                    # neurons sort last but are still probed when budget allows.
+                    cands.append((self.pair_gain.get((ridx, nidx), 0.0),
+                                  ridx, int(nidx)))
+        else:
+            for (ridx, nidx), gain in self.pair_gain.items():
+                if (ridx, nidx) not in decided_keys:
+                    cands.append((gain, ridx, nidx))
         if not cands:
             return
         cands.sort(reverse=True)
@@ -1461,6 +2164,8 @@ class ClauseVivifier:
         undo = self._swap_net_state()
         pool_undo = None
         new_units = 0
+        clamped = 0
+        edges = 0
         try:
             if (self.use_cuts_mode == 'pool' and self.grade == 'beta'
                     and arguments.Config['bab']['cut']['bab_cut']):
@@ -1469,9 +2174,23 @@ class ClauseVivifier:
                 if time.time() - t0 > budget - st.get('reprobe_time', 0.):
                     st['reprobe_truncated'] = st.get('reprobe_truncated', 0) + 1
                     break
+                # Free the allocator between chunks, as the root probe's own
+                # loops do (run_pair_rung / the beta rung). Without this the
+                # pass leaves the cache inflated and the BaB that follows OOMs
+                # in ordinary bounding -- measured on cifar100, where only the
+                # re-probe arm died (1.69 GiB alloc failing with 1.61 GiB free
+                # of 79 GiB) while baseline/canonical/mirror/n32/n256 all
+                # completed 200/200 on the same config.
+                torch.cuda.empty_cache()
                 chunk = pins_per_probe[i:i + self.batch_size]
                 verified = self._run_chunk(chunk)
                 st['reprobe_probes'] = st.get('reprobe_probes', 0) + len(chunk)
+                # Harvest binaries from the SAME bounds the refutation test
+                # just computed -- free, and the payload Marabou gets most of
+                # its value from (see _harvest_reprobe_edges).
+                vlist = verified.tolist()
+                edges += self._harvest_reprobe_edges(
+                    keys[i:i + len(chunk)], vlist, sat_layer, run_key)
                 for j, ok in enumerate(verified.tolist()):
                     if not ok:
                         continue
@@ -1481,19 +2200,43 @@ class ClauseVivifier:
                     ridx, nidx, sign = keys[i + j]
                     if sat_layer.add_run_unit(ridx, nidx, -sign, run_key):
                         new_units += 1
+                        # Deliver the fact where BaB can actually use it.
+                        # add_run_unit only reaches the SAT DB + fact-cut
+                        # channel, which prune at pick time; the branching
+                        # mask is recomputed every iteration from the DOMAIN
+                        # bounds (bab.py: compute_unstable_mask over
+                        # d["lower_bounds"]/["upper_bounds"]), so a neuron
+                        # whose phase we have proven keeps being offered as a
+                        # split candidate. Measured: 15,120 units bought +4.5
+                        # pruned domains/instance and a median domain ratio of
+                        # exactly 1.000 -- the facts never shrank the tree.
+                        # Clamping the static templates fixes that: with
+                        # interm_transfer off they are the source every
+                        # domain's bounds are cloned from, so the neuron goes
+                        # stable and drops out of the mask for good. Same
+                        # mechanism that makes the ROOT probe's forced phases
+                        # pay (it writes ref_lb/ref_ub -> ret -> BaB's
+                        # starting bounds).
+                        clamped += self._clamp_forced_phase(ridx, nidx, -sign)
         except Exception as e:
             print(f'Phase probing re-probe: pass failed ({e!r}).')
         finally:
             if pool_undo is not None:
                 pool_undo()
             undo()
+            # Never hand BaB an inflated allocator after a pass.
+            torch.cuda.empty_cache()
         st['reprobe_units'] = st.get('reprobe_units', 0) + new_units
+        st['reprobe_clamped'] = st.get('reprobe_clamped', 0) + clamped
+        st['reprobe_edges'] = st.get('reprobe_edges', 0) + edges
         st['reprobe_time'] = st.get('reprobe_time', 0.) + time.time() - t0
         print(f"Phase probing re-probe: pass {st['reprobe_passes']} -- "
               f'{len(base_pins)} forced phases pinned, {len(cands)} neurons '
               f'({len(pins_per_probe)} probes) at {self.grade} grade'
               f"{' + pool cuts' if pool_undo is not None else ''}, "
-              f'{new_units} new forced phases, {time.time() - t0:.2f}s '
+              f'{new_units} new forced phases ({clamped} clamped into the '
+              f'branching mask), {edges} new implication edges, '
+              f'{time.time() - t0:.2f}s '
               f"(cumulative: passes={st['reprobe_passes']}, "
               f"probes={st.get('reprobe_probes', 0)}, "
               f"units={st['reprobe_units']}, "
@@ -2079,7 +2822,12 @@ def _probe_and_refine(model, x, c, rhs, or_spec_size, spec_handler, ret):
             f"max_tightening={stats['max_tightening']:.6f}, "
             f"implication_edges={stats['implication_edges']}, "
             f"implied_cuts={stats['implied_cuts']}, "
-            f"time={stats['time']:.2f}s"
+            + (f"coverage_truncated={stats['coverage_truncated']} neurons, "
+               if stats.get('coverage_truncated') else '')
+            + f"time={stats['time']:.2f}s"
+            + (f" (rung: " + ', '.join(
+                f'{r}={t:.2f}s' for r, t in sorted(stats['rung_time'].items())
+              ) + ')' if stats.get('rung_time') else '')
         )
 
     empty_stats = {
@@ -2133,20 +2881,52 @@ def _probe_and_refine(model, x, c, rhs, or_spec_size, spec_handler, ret):
     # ------------------------------------------------------------------
     # Candidate selection.
     # ------------------------------------------------------------------
+    # Ranking mode. The interval score |lb*ub|/(ub-lb) is a purely geometric
+    # proxy: it says a neuron is undecided, not that deciding it matters to the
+    # SPEC. BaBSR weights the same interval term by the neuron's output
+    # sensitivity |lA| (the coefficient CROWN's backward pass already produced),
+    # which is what actually predicts whether a pin can refute anything. Same
+    # cost -- lA is read from `ret`, no extra bound computation.
+    # `--phase_probing_select interval` restores the old ranking.
+    select = cfg.get('select', 'babsr')
+    lA = ret.get('lA') or {}
+    relu_name_of_preact = {}
+    if select == 'babsr' and lA:
+        relus = getattr(prober.net, 'relus', [])
+        for pre_name, ridx in prober.relu_idx_of_preact.items():
+            if ridx < len(relus):
+                relu_name_of_preact[pre_name] = relus[ridx].name
+
     candidates = []
+    babsr_used = 0
     for name in prober.relu_preacts:
         l = prober.orig_lb[name].reshape(-1)
         u = prober.orig_ub[name].reshape(-1)
         unstable = prober.unstable_mask[name].nonzero().reshape(-1)
         if unstable.numel() == 0:
             continue
-        # Instability score |lb*ub|/(ub-lb): high when both phases are wide
-        # relative to the total range; neurons whose split is likely to
-        # matter most are probed first when max_neurons > 0.
+        # Interval term, shared by both modes (BaBSR's "intercept" factor).
         score = (l[unstable] * u[unstable]).abs() \
             / (u[unstable] - l[unstable]).clamp(min=1e-12)
+        if select == 'babsr':
+            # Weight by output sensitivity: mean |lA| over the spec rows,
+            # matching heuristics/babsr.py:babsr_score_intercept_only. Any
+            # layer whose lA is missing or mis-shaped silently keeps the
+            # interval score, so this can only reorder, never crash.
+            a = lA.get(relu_name_of_preact.get(name))
+            if a is not None:
+                try:
+                    w = a.reshape(-1, a.shape[-1]) if a.dim() > 2 else a
+                    w = w.abs().mean(dim=0).reshape(-1).to(score.device)
+                    if w.numel() == l.numel():
+                        score = score * w[unstable].clamp(min=1e-12)
+                        babsr_used += 1
+                except Exception:
+                    pass
         for idx, s in zip(unstable.tolist(), score.tolist()):
             candidates.append((name, idx, s))
+    stats['select_mode'] = select
+    stats['select_babsr_layers'] = babsr_used
     if not candidates:
         _summary(stats, 'no unstable ReLU neurons')
         return False, stats

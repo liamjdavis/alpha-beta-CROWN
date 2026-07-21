@@ -433,6 +433,57 @@ class ConfigHandler:
                           help='Maximum number of unstable neurons to probe (0 = all unstable neurons). If positive, '
                                'the top-N neurons ranked by the instability score |lb*ub|/(ub-lb) are probed.',
                           hierarchy=h + ["max_neurons"])
+        self.add_argument("--phase_probing_wide_root", action='store_true',
+                          dest='phase_probing_wide_root', default=False,
+                          help='Run the ROOT crown rung as a single cross-layer batch instead of one '
+                               'compute_bounds call per pinned layer. The per-neuron clamp is injected by a '
+                               'per-batch-row hook on clamp_interim_bounds rather than through interm_bounds, '
+                               'so probes pinned at different depths share one backward pass while every layer '
+                               'downstream of each row\'s own pin is still recomputed under that pin (the strong '
+                               'oracle). Combine with --phase_probing_max_neurons 0 for full coverage.',
+                          hierarchy=h + ["wide_root"])
+        self.add_argument("--phase_probing_wide_root_window", type=int, default=-1,
+                          help='Depth window for --phase_probing_wide_root: a row only keeps recomputed bounds '
+                               'for layers within this many positions downstream of its own pin; beyond that the '
+                               'root bounds are written back for that row. -1 = unlimited (recompute everything '
+                               'downstream, matching the per-layer root probe). 0 reproduces the all-fixed weak '
+                               'oracle of wide re-probing. Small positive values trade oracle strength for cost, '
+                               'since per-probe cost scales with the number of recomputed layers.',
+                          hierarchy=h + ["wide_root_window"])
+        self.add_argument("--phase_probing_wide_root_time_budget_frac", type=float, default=0.0,
+                          help='Cap wide-root probe wall clock at this fraction of the per-instance timeout '
+                               '(0 = uncapped). Full coverage is cheap in absolute terms but not relative to '
+                               'every config: on tinyimagenet (100s budget) it ran to a 30.2s median / 77.0s max '
+                               'and cost 16 solved instances for zero gains, while cheap-probe configs gained. '
+                               'With a cap the pass stops adding chunks once the budget is spent, so coverage '
+                               'degrades gracefully rather than the search losing its time. Sound: chunks are '
+                               'depth-sorted and self-contained, so a truncated pass is a smaller valid probe '
+                               'set. The dropped-neuron count is reported in the probing summary.',
+                          hierarchy=h + ["time_budget_frac"])
+        self.add_argument("--phase_probing_wide_root_interm_only", action='store_true',
+                          dest='phase_probing_wide_root_interm_only', default=False,
+                          help='Wide root rung computes ONLY the intermediate bounds it harvests, skipping the '
+                               'full-network output pass. compute_bounds is check_prior_bounds (which produces the '
+                               'freed layer bounds behind hull refinement, implication edges and implied cuts) '
+                               'followed by backward_general (the output bound). Measured on tinyimagenet, the '
+                               'output pass is ~0.82s per B=128 chunk -- effectively the whole 28.7s probe time -- '
+                               'and yields 2 forced phases out of 1925 probed neurons. This flag retargets the '
+                               'final node at the deepest freed layer\'s consumer so everything downstream is '
+                               'pruned. Trade-off: no output bound means no probe scores, no forced phases and no '
+                               'oracle escalation; the hull/edge/cut channel is unaffected.',
+                          hierarchy=h + ["wide_root_interm_only"])
+        self.add_argument("--no_phase_probing_wide_root_sparse",
+                          dest='phase_probing_wide_root_sparse',
+                          action='store_false', default=True,
+                          help='Disable sparse intermediate-bound recomputation in the wide root rung. '
+                               'By default the wide rung hands compute_bounds the root bounds as '
+                               'aux_reference_bounds, so only neurons unstable AT THE ROOT are recomputed in a '
+                               'freed layer (the same assumption BaB makes); otherwise auto_LiRPA falls back to '
+                               'IBP to guess stability and densely computes a much larger superset. Measured on '
+                               'cifar100 idx0 at full coverage: 153.2s -> 23.4s, but not free -- implication '
+                               'edges fell 502 -> 130 because refinement of root-stable neurons is skipped. Pass '
+                               'this flag to restore the dense (slow, stronger) behaviour.',
+                          hierarchy=h + ["wide_root_sparse"])
         self.add_argument("--phase_probing_oracle", type=str, default="crown",
                           choices=["crown", "alpha", "beta", "gurobi"],
                           help='Maximum rung of the probe oracle ladder. All probes run at rung "crown" (plain '
@@ -512,6 +563,14 @@ class ConfigHandler:
                                'passes (mirror cores / BCP conflicts); the CPU-side duties keep running. 0 = never '
                                'gate. Takes GPU overhead out of runs whose clause pools have stopped yielding.',
                           hierarchy=h + ["vivify_dry_rounds"])
+        self.add_argument("--phase_probing_select", type=str, default="babsr",
+                          choices=["babsr", "interval"],
+                          help='Root-probe candidate ranking. "babsr" weights the interval score '
+                               '|lb*ub|/(ub-lb) by output sensitivity |lA| (the coefficient CROWN already '
+                               'produced), i.e. BaBSR\'s intercept score -- it ranks by whether deciding a '
+                               'neuron matters to the spec, not just whether it is undecided. "interval" is '
+                               'the original geometry-only ranking. Same cost either way.',
+                          hierarchy=h + ["select"])
         self.add_argument("--phase_probing_reprobe", action='store_true',
                           dest='phase_probing_reprobe', default=False,
                           help='Conditioned re-probing at depth (ported from Marabou): whenever the SAT layer\'s '
@@ -522,6 +581,17 @@ class ConfigHandler:
                                'have run. Refuted pins become run-scoped forced phases feeding the SAT layer and '
                                'the fact-cut channel. Requires --phase_probing_sat_layer.',
                           hierarchy=h + ["reprobe"])
+        self.add_argument("--phase_probing_reprobe_wide", action='store_true',
+                          dest='phase_probing_reprobe_wide', default=False,
+                          help='Re-probe EVERY still-unstable neuron instead of only the ones the root '
+                               'probe examined. The root pass stores hull gains for its top-N (max_neurons, '
+                               'default 64) out of possibly thousands of unstable neurons, and re-probe draws '
+                               'candidates from that store -- so coverage is capped at the root slice (4.4%% on '
+                               'cifar100) regardless of reprobe_max_neurons. Affordable because this path fixes '
+                               'all intermediate bounds and pins per batch row, so probes from different layers '
+                               'share one backward pass. Raise reprobe_max_neurons alongside this flag or the '
+                               'cap still binds.',
+                          hierarchy=h + ["reprobe_wide"])
         self.add_argument("--phase_probing_reprobe_budget", type=float, default=15.0,
                           help='Total wall-clock seconds of re-probing per instance (Marabou uses one global cap '
                                'with no per-pass filtering; their density gate measured as a wash and was '
